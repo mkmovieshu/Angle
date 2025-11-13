@@ -1,4 +1,9 @@
 # server.py
+from fastapi.responses import PlainTextResponse
+
+@app.get("/")
+async def index():
+    return PlainTextResponse("Angle service is running. Use /healthz or POST /webhook for Telegram updates.")
 """
 Single FastAPI web service that:
  - handles Telegram webhook (POST /webhook)
