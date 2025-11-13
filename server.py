@@ -348,4 +348,8 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
     # when running locally, you may want to set webhook manually:
     # asyncio.run(set_telegram_webhook("https://<your-domain>/webhook"))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+from fastapi.responses import PlainTextResponse
+
+@app.get("/")
+async def index():
+    return PlainTextResponse("Angle service is running. Use /healthz or POST /webhook for Telegram updates.")    uvicorn.run(app, host="0.0.0.0", port=port)
