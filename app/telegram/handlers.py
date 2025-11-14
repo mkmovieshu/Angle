@@ -1,104 +1,164 @@
-# app/telegram/handlers.py
-import uuid
-import logging
-from datetime import datetime, timedelta
-from ..database import users_col, videos_col, ad_col
+# ----------------------------------------------------------------------------------
+# REQUIRED WEBHOOK ENTRY FUNCTIONS
+# These are called from FastAPI /webhook endpoint
+# ----------------------------------------------------------------------------------
+
+from telegram import Update
+from telegram.constants import ParseMode
 from ..telegram.bot import bot
-from ..telegram.keyboards import start_keyboard, ad_keyboard, subscribe_menu, plan_contact_keyboard
-from ..config import FREE_BATCH, DOMAIN, PREMIUM_PLANS, ADMIN_IDS, BOT_NAME
-import aiohttp
+from ..config import BOT_NAME
 
-log = logging.getLogger("video-web.handlers")
 
-def now():
-    return datetime.utcnow()
+async def _handle_message(msg: dict):
+    """Handles normal user messages."""
+    user_id = msg["chat"]["id"]
+    username = msg["from"].get("username")
+    text = msg.get("text", "")
 
-async def ensure_user(user_id:int, username: str=None):
-    user = await users_col.find_one({"user_id":user_id})
-    if user:
-        return user
-    doc = {
-        "user_id": user_id,
-        "username": username,
-        "video_index": 0,
-        "free_used_in_cycle": 0,
-        "cycle": 0,
-        "sent_file_ids": [],   # to prevent repeats for premium users
-        "premium_until": None,
+    user = await ensure_user(user_id, username)
+
+    # Basic commands
+    if text == "/start":
+        await bot.send_message(
+            chat_id=user_id,
+            text=f"👋 Welcome to {BOT_NAME}!\nChoose an option:",
+            reply_markup=start_keyboard()
+        )
+        return
+
+    # If unknown message
+    await bot.send_message(
+        chat_id=user_id,
+        text="Please use the menu buttons below 👇",
+        reply_markup=start_keyboard()
+    )
+
+
+async def _handle_callback(cb: dict):
+    """Handles button clicks."""
+    query_id = cb["id"]
+    data = cb["data"]
+    user_id = cb["from"]["id"]
+    msg_id = cb["message"]["message_id"]
+    username = cb["from"].get("username")
+
+    await bot.answer_callback_query(query_id)
+
+    user = await ensure_user(user_id, username)
+
+    # -------------------------------------------------------
+    # START FREE VIDEO
+    # -------------------------------------------------------
+    if data == "free_video":
+        # check premium or free limits
+        if await is_premium(user):
+            ok, err = await send_video_to_user(user_id, user)
+            if not ok:
+                await bot.send_message(user_id, "No videos available.")
+            return
+
+        # free users – check limit
+        if user.get("free_used_in_cycle", 0) >= 5:
+            token, redirect = await create_ad_session(user_id)
+            await bot.edit_message_text(
+                chat_id=user_id,
+                message_id=msg_id,
+                text="To unlock more videos, please watch this short ad:",
+                reply_markup=ad_keyboard(redirect, token)
+            )
+            return
+
+        # normal free video
+        ok, err = await send_video_to_user(user_id, user)
+        if not ok:
+            await bot.send_message(user_id, "No videos available.")
+        return
+
+    # -------------------------------------------------------
+    # WATCHED AD → CHECK
+    # -------------------------------------------------------
+    if data.startswith("ad_check:"):
+        token = data.split(":", 1)[1]
+        rec = await ad_col.find_one({"token": token})
+        if not rec or rec.get("status") != "completed":
+            await bot.send_message(user_id, "❌ Ad not completed yet.")
+            return
+
+        # reset free cycle
+        await users_col.update_one(
+            {"user_id": user_id},
+            {"$set": {"free_used_in_cycle": 0}}
+        )
+        await bot.send_message(
+            chat_id=user_id,
+            text="✅ Ad verified! You unlocked 5 more free videos.",
+            reply_markup=start_keyboard()
+        )
+        return
+
+    # -------------------------------------------------------
+    # SUBSCRIBE MENU
+    # -------------------------------------------------------
+    if data == "subscribe":
+        await bot.edit_message_text(
+            chat_id=user_id,
+            message_id=msg_id,
+            text="Choose a premium plan:",
+            reply_markup=subscribe_menu()
+        )
+        return
+
+    # -------------------------------------------------------
+    # SHOW PLAN DETAILS
+    # -------------------------------------------------------
+    if data.startswith("show_plans:"):
+        plan_key = data.split(":", 1)[1]
+        plan = PREMIUM_PLANS.get(plan_key, {})
+        label = plan.get("label", "Premium")
+        price = plan.get("price_label", "")
+        days = plan.get("days", 30)
+
+        caption = (
+            f"🔥 **{label}**\n"
+            f"Duration: **{days} days**\n"
+            f"Price: **{price}**\n\n"
+            f"Contact admin to activate your plan."
+        )
+
+        await bot.send_photo(
+            chat_id=user_id,
+            photo=SUBSCRIBE_IMAGE_URL,
+            caption=caption,
+            parse_mode="Markdown",
+            reply_markup=plan_contact_keyboard(plan_key)
+        )
+        return
+
+    if data == "subscribe_back":
+        await bot.edit_message_text(
+            chat_id=user_id,
+            message_id=msg_id,
+            text="Choose a premium plan:",
+            reply_markup=subscribe_menu()
+        )
+        return
+
+
+async def _handle_channel_post(post: dict):
+    """Handles BIN channel videos → imports into DB automatically."""
+    chat_id = post["chat"]["id"]
+    if "video" not in post:
+        return
+
+    file_id = post["video"]["file_id"]
+    caption = post.get("caption", "")
+
+    await videos_col.insert_one({
+        "file_id": file_id,
+        "caption": caption,
+        "channel_id": chat_id,
+        "message_id": post.get("message_id"),
         "created_at": now()
-    }
-    await users_col.insert_one(doc)
-    return doc
+    })
 
-async def is_premium(user_doc) -> bool:
-    pu = user_doc.get("premium_until")
-    if not pu:
-        return False
-    if isinstance(pu, str):
-        pu = datetime.fromisoformat(pu)
-    return pu > now()
-
-# choose next unseen video for user (premium avoids repeats)
-async def get_next_video_for_user(user_doc):
-    # fetch all videos
-    sent = set(user_doc.get("sent_file_ids", []))
-    # first try find a video not in sent
-    cursor = videos_col.find().sort("created_at",1)
-    async for v in cursor:
-        fid = v.get("file_id")
-        if fid not in sent:
-            return v
-    # if all sent, return None (or optionally allow looping by clearing sent)
-    return None
-
-# send video helper (for both free and premium)
-async def send_video_to_user(user_id:int, user_doc):
-    # premium: get unseen
-    if await is_premium(user_doc):
-        vdoc = await get_next_video_for_user(user_doc)
-        if not vdoc:
-            # all seen — clear sent_file_ids to allow loop (or keep empty to stop)
-            # here we choose to clear so premium users can see again after full cycle
-            await users_col.update_one({"user_id":user_id}, {"$set":{"sent_file_ids":[]}})
-            user_doc = await users_col.find_one({"user_id":user_id})
-            vdoc = await get_next_video_for_user(user_doc)
-            if not vdoc:
-                return False, "no_videos"
-        try:
-            await bot.send_video(chat_id=user_id, video=vdoc["file_id"], caption=vdoc.get("caption",""))
-            await users_col.update_one({"user_id":user_id}, {"$push":{"sent_file_ids": vdoc["file_id"]}})
-            return True, None
-        except Exception as e:
-            log.exception("send_video error")
-            return False, str(e)
-    # non-premium: behave as before using video_index
-    else:
-        idx = user_doc.get("video_index",0)
-        docs = await videos_col.find().sort("created_at",1).skip(idx).limit(1).to_list(length=1)
-        if not docs:
-            return False, "no_videos"
-        vdoc = docs[0]
-        try:
-            await bot.send_video(chat_id=user_id, video=vdoc["file_id"], caption=vdoc.get("caption",""))
-            await users_col.update_one({"user_id":user_id},{"$inc":{"video_index":1,"free_used_in_cycle":1}})
-            return True, None
-        except Exception as e:
-            log.exception("send_video error_non_premium")
-            return False, str(e)
-
-# create ad session in DB (internal)
-async def create_ad_session(user_id:int, video_key=None):
-    token = uuid.uuid4().hex
-    rec = {
-        "token": token,
-        "user_id": user_id,
-        "video_key": video_key,
-        "status": "pending",
-        "created_at": now(),
-        "clicked_at": None,
-        "completed_at": None
-    }
-    await ad_col.insert_one(rec)
-    host = DOMAIN or "angle-ylzn.onrender.com"
-    redirect = f"https://{host}/ad/redirect?token={token}"
-    return token, redirect
+    print("Imported video:", file_id)
