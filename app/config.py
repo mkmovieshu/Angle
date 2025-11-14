@@ -2,15 +2,15 @@
 import os
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+MONGO_URI = os.getenv("MONGO_URI",)
 DB_NAME = os.getenv("DB_NAME", "video_bot_db")
-ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS","").split(",") if x.strip()]
-BIN_CHANNEL = os.getenv("BIN_CHANNEL", None)
+ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS","8185007347").split(",") if x.strip()]
+BIN_CHANNEL = os.getenv("BIN_CHANNEL","-1002276555116")
 FREE_BATCH = int(os.getenv("FREE_BATCH","5"))
 AD_TARGET_URL = os.getenv("AD_TARGET_URL","https://example.com/adpage")
 DOMAIN = os.getenv("DOMAIN", None)
-ADMIN_CONTACT_URL = os.getenv("ADMIN_CONTACT_URL", "")
-SUBSCRIBE_IMAGE_URL = os.getenv("SUBSCRIBE_IMAGE_URL", "")
+ADMIN_CONTACT_URL = os.getenv("ADMIN_CONTACT_URL", "https://t.me/mkadmin_sir")
+SUBSCRIBE_IMAGE_URL = os.getenv("SUBSCRIBE_IMAGE_URL", "https://envs.sh/6Cu.jpg")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 BOT_NAME = os.getenv("BOT_NAME", "ANGEL")
 
