@@ -1,11 +1,11 @@
 # server.py
 """
-Single-file FastAPI web service for:
- - Telegram webhook (POST /webhook)
+FastAPI web service for:
+ - Telegram webhook (POST /webhook) handling: message, callback_query, channel_post
  - Ad endpoints: /ad/create, /ad/redirect, /ad/callback, /ad/status/{token}
- - MongoDB via motor (async)
- - Sending messages/videos via python-telegram-bot's async Bot
- - Health and root routes
+ - Admin debug endpoints: list/insert videos
+ - MongoDB (motor) async integration
+ - Sends messages/videos via python-telegram-bot async Bot
 """
 
 import os
@@ -17,23 +17,23 @@ from typing import Optional
 import motor.motor_asyncio
 import aiohttp
 import uvicorn
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Header
 from fastapi.responses import RedirectResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 
 # ---------------------------
-# Configuration (from env)
+# Config (env)
 # ---------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 DB_NAME = os.getenv("DB_NAME", "video_bot_db")
 ADMIN_IDS = set(int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip())
-BIN_CHANNEL = os.getenv("BIN_CHANNEL", None)
+BIN_CHANNEL = os.getenv("BIN_CHANNEL", None)  # optional channel id to copy posts (not used by default)
 FREE_BATCH = int(os.getenv("FREE_BATCH", "5"))
 AD_TARGET_URL = os.getenv("AD_TARGET_URL", "https://example.com/adpage")
-DOMAIN = os.getenv("DOMAIN", None)  # optional; if not set will derive from request
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")  # optional, not enforced here
+DOMAIN = os.getenv("DOMAIN", None)
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")  # optional secret for Telegram webhook verification
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN env required")
@@ -45,7 +45,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("video-web")
 
 # ---------------------------
-# Mongo init (motor)
+# Mongo (motor)
 # ---------------------------
 mongo_client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
 db = mongo_client[DB_NAME]
@@ -53,10 +53,20 @@ users_col = db["users"]
 videos_col = db["videos"]
 ad_col = db["ad_sessions"]
 
+# create useful indexes (idempotent)
+async def ensure_indexes():
+    try:
+        await videos_col.create_index([("file_id", 1)], unique=False)
+        await videos_col.create_index([("channel_id", 1), ("message_id", 1)], unique=True, sparse=True)
+        await ad_col.create_index([("token", 1)], unique=True)
+        await users_col.create_index([("user_id", 1)], unique=True)
+    except Exception:
+        log.exception("ensure_indexes failed")
+
 # ---------------------------
 # Telegram Bot (async)
 # ---------------------------
-bot = Bot(token=BOT_TOKEN)  # python-telegram-bot's Bot supports async methods in v20+
+bot = Bot(token=BOT_TOKEN)
 
 # ---------------------------
 # FastAPI app
@@ -73,10 +83,8 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 async def ensure_user_doc(user_id: int, username: Optional[str]):
-    """Ensure user doc exists and has required fields."""
     user = await users_col.find_one({"user_id": user_id})
     if user:
-        # ensure necessary fields present
         set_fields = {}
         if "video_index" not in user:
             set_fields["video_index"] = 0
@@ -128,7 +136,7 @@ def make_ad_keyboard(redirect_url: str, token: str):
     return InlineKeyboardMarkup(kb)
 
 # ---------------------------
-# Pydantic models for ad callbacks
+# Pydantic models
 # ---------------------------
 class AdCreateIn(BaseModel):
     user_id: Optional[int] = None
@@ -141,6 +149,11 @@ class AdCallbackIn(BaseModel):
 # ---------------------------
 # Root & health
 # ---------------------------
+@app.on_event("startup")
+async def startup_event():
+    log.info("Application startup: ensuring DB indexes")
+    await ensure_indexes()
+
 @app.get("/", response_class=PlainTextResponse)
 async def index():
     return "Angle service is running. Use /healthz or POST /webhook for Telegram updates."
@@ -154,10 +167,6 @@ async def healthz():
 # ---------------------------
 @app.post("/ad/create")
 async def ad_create(payload: AdCreateIn, request: Request):
-    """
-    Create an ad session token and return redirect URL.
-    Redirect URL will be built using DOMAIN env var if set, otherwise the current request host.
-    """
     token = uuid.uuid4().hex
     rec = {
         "token": token,
@@ -170,35 +179,23 @@ async def ad_create(payload: AdCreateIn, request: Request):
     }
     await ad_col.insert_one(rec)
 
-    # Build redirect host
     if DOMAIN:
         host = DOMAIN
     else:
-        # derive from request
-        url = request.url
-        host = url.netloc
+        host = request.url.netloc
     redirect_url = f"https://{host}/ad/redirect?token={token}"
     return JSONResponse({"token": token, "redirect_url": redirect_url}, status_code=201)
 
 @app.get("/ad/redirect")
 async def ad_redirect(token: str):
-    """
-    Logs click and redirects to AD_TARGET_URL with token appended.
-    AD_TARGET_URL should be an ad page that will call /ad/callback when ad is completed.
-    """
     if not token:
         raise HTTPException(status_code=400, detail="token required")
     await ad_col.update_one({"token": token}, {"$set": {"clicked_at": now()}})
-    # attach token to AD_TARGET_URL so ad-host can callback
     dst = f"{AD_TARGET_URL}?token={token}"
     return RedirectResponse(dst)
 
 @app.post("/ad/callback")
 async def ad_callback(payload: AdCallbackIn):
-    """
-    Called by ad-provider or your ad page when ad completed.
-    Payload: {"token":"...", "status":"completed"}
-    """
     token = payload.token
     status = payload.status
     if not token:
@@ -216,30 +213,56 @@ async def ad_status(token: str):
     return {"token": rec.get("token"), "status": rec.get("status", "pending")}
 
 # ---------------------------
-# Telegram webhook endpoint
+# Admin debug endpoints (temporary)
+# ---------------------------
+def _admin_check_simple(admin_id: int) -> bool:
+    return admin_id in ADMIN_IDS
+
+@app.get("/admin/list_videos")
+async def admin_list_videos(admin_id: int):
+    if not _admin_check_simple(admin_id):
+        raise HTTPException(status_code=403, detail="forbidden")
+    docs = await videos_col.find().sort("created_at", -1).to_list(length=200)
+    items = [{"_id": str(d.get("_id")), "file_id": d.get("file_id"), "caption": d.get("caption"), "channel_id": d.get("channel_id")} for d in docs]
+    return {"count": len(items), "videos": items}
+
+@app.post("/admin/insert_video")
+async def admin_insert_video(admin_id: int, file_id: str, caption: Optional[str] = ""):
+    if not _admin_check_simple(admin_id):
+        raise HTTPException(status_code=403, detail="forbidden")
+    rec = {"file_id": file_id, "caption": caption, "uploader": admin_id, "created_at": now()}
+    res = await videos_col.insert_one(rec)
+    return {"inserted_id": str(res.inserted_id)}
+
+# ---------------------------
+# Telegram webhook handler
 # ---------------------------
 @app.post("/webhook")
-async def telegram_webhook(request: Request):
-    """
-    Telegram will POST updates here (messages, callback_query).
-    We parse and dispatch to handlers.
-    """
+async def telegram_webhook(request: Request, x_telegram_secret: Optional[str] = Header(None)):
+    # optional secret validation
+    if WEBHOOK_SECRET:
+        if x_telegram_secret != WEBHOOK_SECRET:
+            log.warning("Invalid webhook secret header")
+            raise HTTPException(status_code=403, detail="invalid webhook secret")
+
     try:
         data = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="invalid json")
 
-    # basic routing of update types
+    # route update types
     if "message" in data:
         await _handle_message(data["message"])
     elif "callback_query" in data:
         await _handle_callback(data["callback_query"])
+    elif "channel_post" in data:
+        await _handle_channel_post(data["channel_post"])
     else:
-        log.info("Unhandled update type")
+        log.info("Unhandled update type: keys=%s", list(data.keys()))
     return {"ok": True}
 
 # ---------------------------
-# Internal helpers: send video by index
+# Video sending helper
 # ---------------------------
 async def send_video_to_user_by_index(user_id: int, idx: int):
     docs = await videos_col.find().sort("created_at", 1).skip(idx).limit(1).to_list(length=1)
@@ -257,23 +280,18 @@ async def send_video_to_user_by_index(user_id: int, idx: int):
 # Message handler
 # ---------------------------
 async def _handle_message(msg: dict):
-    """
-    Handle incoming messages (commands, forwarded videos).
-    Admins can forward video messages to import into videos collection.
-    """
     user = msg.get("from", {}) or {}
     user_id = user.get("id")
     username = user.get("username")
-    chat = msg.get("chat", {}) or {}
     text = msg.get("text", "") or ""
 
-    # ensure user
     if user_id is None:
         log.info("message without user")
         return
+
     udoc = await ensure_user_doc(user_id, username)
 
-    # admin forwarding import flow
+    # admin forwarding import (legacy)
     if ("forward_from_chat" in msg or "forward_from" in msg) and (msg.get("video") or msg.get("document")):
         if is_admin(user_id):
             media = msg.get("video") or msg.get("document")
@@ -293,7 +311,6 @@ async def _handle_message(msg: dict):
             log.exception("failed to send welcome")
         return
 
-    # other messages ignored for now
     return
 
 # ---------------------------
@@ -310,7 +327,6 @@ async def _handle_callback(cq: dict):
     if user_id is None:
         return
 
-    # ack callback quickly
     try:
         await bot.answer_callback_query(callback_query_id=cq.get("id"))
     except Exception:
@@ -319,7 +335,7 @@ async def _handle_callback(cq: dict):
     udoc = await ensure_user_doc(user_id, username)
     premium = await is_premium(udoc)
 
-    # help / subscribe
+    # simple helpers
     if data == "help":
         try:
             await bot.edit_message_text(chat_id=user_id, message_id=msg_id, text="Help: Free 5 -> watch ad -> next 5. Subscribe for unlimited.")
@@ -334,9 +350,7 @@ async def _handle_callback(cq: dict):
             pass
         return
 
-    # free_video flow
     if data == "free_video":
-        # premium gets next video without ad gating
         if premium:
             ok, err = await send_video_to_user_by_index(user_id, udoc.get("video_index", 0))
             if ok:
@@ -352,7 +366,7 @@ async def _handle_callback(cq: dict):
                     pass
             return
 
-        # non-premium gating
+        # non-premium flow
         if udoc.get("free_used_in_cycle", 0) < FREE_BATCH:
             ok, err = await send_video_to_user_by_index(user_id, udoc.get("video_index", 0))
             if ok:
@@ -366,12 +380,10 @@ async def _handle_callback(cq: dict):
                         pass
                     return
                 else:
-                    # create ad session and send ad keyboard
-                    # use our own ad/create endpoint to create token & redirect
-                    host = DOMAIN or "yourdomain.com"
-                    # if DOMAIN not set, use service host derived from bot (can't here) - rely on ad_create route for correct redirect
+                    # create ad session internally
                     try:
-                        # call our ad/create endpoint internally via HTTP to get redirect (so token is generated server-side)
+                        # construct ad/create using service host
+                        host = DOMAIN or "localhost"
                         async with aiohttp.ClientSession() as s:
                             async with s.post(f"https://{host}/ad/create", json={"user_id": user_id}, timeout=10) as resp:
                                 if resp.status == 201:
@@ -395,11 +407,9 @@ async def _handle_callback(cq: dict):
                     pass
                 return
 
-    # ad_check token verification
     if data and data.startswith("ad_check:"):
         token = data.split(":", 1)[1]
-        # check ad status via our endpoint
-        host = DOMAIN or "yourdomain.com"
+        host = DOMAIN or "localhost"
         try:
             async with aiohttp.ClientSession() as s:
                 async with s.get(f"https://{host}/ad/status/{token}", timeout=6) as resp:
@@ -427,12 +437,62 @@ async def _handle_callback(cq: dict):
         return
 
 # ---------------------------
-# Set webhook helper (call once if you prefer)
+# Channel post handler (automatic import from BIN channel)
+# ---------------------------
+async def _handle_channel_post(post: dict):
+    """
+    Handle channel_post updates: insert video/doc into videos_col automatically.
+    Bot must be admin in the channel for these updates to arrive.
+    """
+    try:
+        chat = post.get("chat", {}) or {}
+        chat_id = chat.get("id")
+        message_id = post.get("message_id")
+
+        media = post.get("video") or post.get("document")
+        if not media:
+            log.info("channel_post ignored: no media (chat_id=%s, msg_id=%s)", chat_id, message_id)
+            return
+
+        file_id = media.get("file_id")
+        caption = post.get("caption", "")
+
+        if not file_id:
+            log.warning("channel_post media missing file_id (chat_id=%s, msg_id=%s)", chat_id, message_id)
+            return
+
+        # avoid duplicates by channel_id+message_id or file_id
+        existing = await videos_col.find_one({"$or":[{"file_id": file_id}, {"channel_id": chat_id, "message_id": message_id}]})
+        if existing:
+            log.info("channel_post already exists in DB, skipping: file_id=%s", file_id)
+            return
+
+        rec = {
+            "file_id": file_id,
+            "caption": caption,
+            "uploader": None,
+            "channel_id": chat_id,
+            "message_id": message_id,
+            "imported_via": "channel_post",
+            "created_at": now()
+        }
+        res = await videos_col.insert_one(rec)
+        log.info("Imported channel_post video into DB id=%s file_id=%s", res.inserted_id, file_id)
+
+        # Optionally forward or copy to BIN_CHANNEL if desired:
+        # if BIN_CHANNEL and str(chat_id) != str(BIN_CHANNEL):
+        #     try:
+        #         await bot.forward_message(chat_id=BIN_CHANNEL, from_chat_id=chat_id, message_id=message_id)
+        #     except Exception:
+        #         log.exception("forward to BIN_CHANNEL failed")
+
+    except Exception:
+        log.exception("Exception in _handle_channel_post")
+
+# ---------------------------
+# Webhook helper to set webhook (optional)
 # ---------------------------
 async def set_telegram_webhook(webhook_url: str):
-    """
-    Use this helper to set webhook programmatically if needed.
-    """
     try:
         return await bot.set_webhook(url=webhook_url)
     except Exception:
@@ -444,5 +504,4 @@ async def set_telegram_webhook(webhook_url: str):
 # ---------------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
-    # run with uvicorn programmatically
     uvicorn.run("server:app", host="0.0.0.0", port=port, log_level="info")
