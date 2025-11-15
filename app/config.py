@@ -1,22 +1,15 @@
-# app/config.py
 import os
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-MONGO_URI = os.getenv("MONGO_URI",)
-DB_NAME = os.getenv("DB_NAME", "video_bot_db")
-ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS","8185007347").split(",") if x.strip()]
-BIN_CHANNEL = os.getenv("BIN_CHANNEL","-1002276555116")
-FREE_BATCH = int(os.getenv("FREE_BATCH","5"))
-AD_TARGET_URL = os.getenv("AD_TARGET_URL","https://example.com/adpage")
-DOMAIN = os.getenv("DOMAIN", None)
-ADMIN_CONTACT_URL = os.getenv("ADMIN_CONTACT_URL", "https://t.me/mkadmin_sir")
-SUBSCRIBE_IMAGE_URL = os.getenv("SUBSCRIBE_IMAGE_URL", "https://envs.sh/6Cu.jpg")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
-BOT_NAME = os.getenv("BOT_NAME", "ANGEL")
+MONGO_URL = os.getenv("MONGO_URL")
 
-# Premium plans (days -> label & price example)
-PREMIUM_PLANS = {
-    "plan_10": {"days":10, "label":"10 days - Trial", "price_label":"₹99"},
-    "plan_20": {"days":20, "label":"20 days - Standard", "price_label":"₹179"},
-    "plan_30": {"days":30, "label":"30 days - Pro", "price_label":"₹249"},
-}
+# Your Render domain (no https://)
+DOMAIN = os.getenv("DOMAIN")  # example: angle-jldx.onrender.com
+
+# ShortXLinks API Key
+SHORTX_API_KEY = os.getenv("SHORTX_API_KEY")
+
+BIN_CHANNEL = int(os.getenv("BIN_CHANNEL"))  # వీడియోలు స్టోర్ ఉన్న channel ID
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN missing")
