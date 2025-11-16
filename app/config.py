@@ -1,30 +1,47 @@
 # app/config.py
 import os
 
+# Core required envs
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URL = os.getenv("MONGO_URL")
-
-# Your Render domain (no https://)
 DOMAIN = os.getenv("DOMAIN")  # example: angle-jldx.onrender.com
 
-# ShortXLinks API Key (optional)
+# Optional ad provider key
 SHORTX_API_KEY = os.getenv("SHORTX_API_KEY")
 
-# BIN channel (optional). If not provided, set to None.
+# BIN channel (where videos are posted) - numeric chat id or None
 _bin_channel = os.getenv("BIN_CHANNEL")
 try:
-    BIN_CHANNEL = int(_bin_channel) if _bin_channel is not None else None
+    BIN_CHANNEL = int(_bin_channel) if _bin_channel not in (None, "") else None
 except ValueError:
-    raise RuntimeError(f"Invalid BIN_CHANNEL value: {_bin_channel!r}. It must be an integer chat id.")
+    raise RuntimeError(f"Invalid BIN_CHANNEL value: {_bin_channel!r}. Must be integer chat id.")
 
-# ADMIN chat id for error/alert notifications (optional)
-_admin_chat = os.getenv("ADMIN_CHAT_ID")
+# ADMIN chat id for notifications - numeric or None
+_admin = os.getenv("ADMIN_CHAT_ID")
 try:
-    ADMIN_CHAT_ID = int(_admin_chat) if _admin_chat is not None else None
+    ADMIN_CHAT_ID = int(_admin) if _admin not in (None, "") else None
 except ValueError:
-    raise RuntimeError(f"Invalid ADMIN_CHAT_ID value: {_admin_chat!r}. It must be an integer chat id.")
+    raise RuntimeError(f"Invalid ADMIN_CHAT_ID value: {_admin!r}. Must be integer chat id.")
 
-# Basic validation for truly required vars:
+# REQUIRED GROUP enforcement (optional)
+# If set, bot will require users to be members of this chat to get videos.
+_required = os.getenv("REQUIRED_GROUP_ID")
+try:
+    REQUIRED_GROUP_ID = int(_required) if _required not in (None, "") else None
+except ValueError:
+    raise RuntimeError(f"Invalid REQUIRED_GROUP_ID value: {_required!r}. Must be integer chat id (e.g. -100123...)")
+
+# Optional invite URL to show users
+REQUIRED_GROUP_INVITE = os.getenv("REQUIRED_GROUP_INVITE")  # e.g. https://t.me/joinchat/XXXX
+
+# Free limit default (can override via env)
+_free_limit = os.getenv("FREE_LIMIT")
+try:
+    FREE_LIMIT = int(_free_limit) if _free_limit not in (None, "") else 5
+except ValueError:
+    FREE_LIMIT = 5
+
+# Basic validation: ensure truly required envs exist
 _missing = []
 if not BOT_TOKEN:
     _missing.append("BOT_TOKEN")
@@ -34,4 +51,5 @@ if not DOMAIN:
     _missing.append("DOMAIN")
 
 if _missing:
+    # Fail fast so you catch missing envs during deploy time
     raise RuntimeError(f"Missing required environment variables: {', '.join(_missing)}")
