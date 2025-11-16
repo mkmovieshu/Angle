@@ -20,7 +20,7 @@ async def ad_return(token: str, uid: int):
     <html><body style='text-align:center;font-family:Arial'>
     <h2>🎉 Ad Completed</h2>
     <p>Tap button below to return to ANGEL Bot</p>
-    <a href="https://t.me/ANGELBot?start=ad_{token}">
+    <a href="https://t.me/mk_post0_bot?start=ad_{token}">
         <button style='padding:10px 20px;'>Return to Bot</button>
     </a>
     </body></html>
