@@ -1,7 +1,8 @@
 # app/telegram/handlers.py
+
 import logging
 from datetime import datetime
-from typing import Optional, Any, Dict, List
+from typing import Optional, Dict, Any, List
 
 from telegram import Update, Message
 from telegram.error import TelegramError
@@ -12,322 +13,211 @@ from app.ads.service import create_ad_session
 from app.telegram.keyboards import video_control_buttons
 from app.config import ADMIN_CHAT_ID
 
-log = logging.getLogger("app.telegram.handlers")
+log = logging.getLogger("handlers")
 log.setLevel(logging.INFO)
 
-FREE_LIMIT = 5  # number of free videos per cycle
+FREE_LIMIT = 5
 
 
-def _now_iso():
+def _now():
     return datetime.utcnow().isoformat()
 
 
-async def _ensure_user_doc(user_id: int, username: Optional[str] = None) -> Dict[str, Any]:
+async def _ensure_user(user_id: int, username: Optional[str] = None):
     u = await users.find_one({"user_id": user_id})
     if u:
-        # ensure sent_file_ids exists
         if "sent_file_ids" not in u:
             await users.update_one({"user_id": user_id}, {"$set": {"sent_file_ids": []}})
             u["sent_file_ids"] = []
         return u
+
     doc = {
         "user_id": user_id,
         "username": username,
         "free_used": 0,
-        "created_at": _now_iso(),
         "premium_until": None,
-        "sent_file_ids": [],  # track which file_ids we've sent to this user
+        "sent_file_ids": [],
+        "created_at": _now()
     }
+
     await users.insert_one(doc)
     return doc
 
 
-async def _get_unseen_video_for_user(user_doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Return first video doc from videos collection that user hasn't received yet.
-    If user has received all, return None.
-    """
-    sent_list: List[str] = user_doc.get("sent_file_ids", []) or []
+async def _pick_unseen_video(u):
+    sent = u.get("sent_file_ids", [])
 
-    # Fetch some candidates (we limit to 200 to avoid huge reads)
-    cursor = videos.find({}).sort("created_at", 1).limit(200)
-    try:
-        candidates = await cursor.to_list(length=200)
-    except Exception:
-        # motor may not support to_list on our FakeColl fallback; try fallback approach
-        candidates = []
-        async for doc in videos.find({}):
-            candidates.append(doc)
+    all_videos = []
+    async for v in videos.find({}, sort=[("created_at", 1)]):
+        all_videos.append(v)
 
-    for doc in candidates:
-        fid = doc.get("file_id")
-        if fid and fid not in sent_list:
-            return doc
+    for v in all_videos:
+        fid = v.get("file_id")
+        if fid and fid not in sent:
+            return v
+
     return None
 
 
-async def _record_sent_file_for_user(user_id: int, file_id: str):
-    # push file_id into user's sent_file_ids if not present
+async def _record_sent(user_id, file_id):
     await users.update_one({"user_id": user_id}, {"$addToSet": {"sent_file_ids": file_id}})
 
 
-# ---------------- channel_post import ----------------
 async def handle_channel_post(msg: Message):
     try:
-        chat = msg.chat
-        chat_id = chat.id
         file_id = None
-        media_type = None
+        media = None
 
         if msg.video:
             file_id = msg.video.file_id
-            media_type = "video"
+            media = "video"
         elif msg.document:
             file_id = msg.document.file_id
-            media_type = "document"
+            media = "document"
         elif msg.animation:
             file_id = msg.animation.file_id
-            media_type = "animation"
-        elif msg.video_note:
-            file_id = msg.video_note.file_id
-            media_type = "video_note"
+            media = "animation"
 
         if not file_id:
             return
 
+        exist = await videos.find_one({"file_id": file_id})
+        if exist:
+            return
+
         doc = {
             "file_id": file_id,
-            "type": media_type,
+            "type": media,
             "caption": msg.caption or "",
-            "from_channel_id": chat_id,
-            "channel_post_id": msg.message_id,
-            "created_at": _now_iso()
+            "created_at": _now()
         }
 
-        exists = await videos.find_one({"$or": [{"file_id": file_id}, {"channel_post_id": msg.message_id}]})
-        if exists:
-            log.info("Channel post already stored file_id=%s post=%s", file_id, msg.message_id)
-            return
-
         await videos.insert_one(doc)
-        log.info("Imported channel video file_id=%s from channel %s", file_id, chat_id)
 
         if ADMIN_CHAT_ID:
             try:
-                await bot.send_message(ADMIN_CHAT_ID, f"Imported video from channel {chat.title or chat_id}: file_id={file_id}")
-            except Exception:
+                await bot.send_message(ADMIN_CHAT_ID, f"Imported video {file_id}")
+            except:
                 pass
 
     except Exception as e:
-        log.exception("Error in handle_channel_post: %s", e)
-        if ADMIN_CHAT_ID:
-            try:
-                await bot.send_message(ADMIN_CHAT_ID, f"Error importing channel post: {e}")
-            except Exception:
-                pass
+        log.exception("handle_channel_post error: %s", e)
 
 
-# ---------------- main webhook entry ----------------
-async def handle_update(raw_update: dict):
+async def handle_update(raw):
     try:
-        update = Update.de_json(raw_update, bot)
-    except Exception as e:
-        log.exception("Failed to parse update JSON: %s", e)
+        update = Update.de_json(raw, bot)
+    except Exception:
         return
 
-    try:
-        if update.channel_post:
-            await handle_channel_post(update.channel_post)
-            return
+    if update.channel_post:
+        await handle_channel_post(update.channel_post)
+        return
 
-        if update.message:
-            await handle_message(update)
-            return
+    if update.message:
+        await handle_message(update)
+        return
 
-        if update.callback_query:
-            await handle_callback(update)
-            return
-
-    except Exception as e:
-        log.exception("Unhandled error in handle_update: %s", e)
-        if ADMIN_CHAT_ID:
-            try:
-                await bot.send_message(ADMIN_CHAT_ID, f"Handler error: {e}")
-            except Exception:
-                pass
+    if update.callback_query:
+        await handle_callback(update)
+        return
 
 
-# ---------------- send one video with control buttons ----------------
-async def _send_one_video_with_controls(chat_id: int, user_doc: Dict[str, Any], ad_token: Optional[str] = None, ad_short_url: Optional[str] = None) -> bool:
-    """
-    Choose unseen video for user and send with control buttons (Next, Free Count, Buy Premium).
-    If no unseen video, inform user.
-    If ad_token/ad_short_url provided, buttons show ad options instead of Next.
-    """
-    # get unseen video
-    vid = await _get_unseen_video_for_user(user_doc)
+async def _send_video(chat_id, u, ad_token=None, ad_url=None):
+    vid = await _pick_unseen_video(u)
     if not vid:
-        # user has seen all videos
-        await bot.send_message(chat_id, "You have watched all available videos. We'll rotate them again soon.")
+        await bot.send_message(chat_id, "No more videos available.")
         return False
 
-    file_id = vid.get("file_id")
+    file_id = vid["file_id"]
     caption = vid.get("caption", "")
 
+    kb = video_control_buttons(ad_token, ad_url)
+
     try:
-        # prepare buttons (if ad provided, keyboard will contain ad buttons)
-        kb = video_control_buttons(token_for_ad=ad_token, ad_short_url=ad_short_url)
-
-        # send video with reply_markup
-        await bot.send_video(chat_id=chat_id, video=file_id, caption=caption, reply_markup=kb)
-
-        # record that we sent this file to this user
-        await _record_sent_file_for_user(user_doc["user_id"], file_id)
+        await bot.send_video(chat_id, file_id, caption=caption, reply_markup=kb)
+        await _record_sent(u["user_id"], file_id)
         return True
     except TelegramError as e:
-        log.exception("Failed to send video to %s: %s", chat_id, e)
-        try:
-            await bot.send_message(chat_id, "Failed to send video. Try again later.")
-        except Exception:
-            pass
+        log.exception("send_video error: %s", e)
         return False
 
 
-# ---------------- message handler ----------------
 async def handle_message(update: Update):
     msg = update.message
-    if not msg:
-        return
-
     user = msg.from_user
     user_id = user.id
-    username = getattr(user, "username", None)
 
-    u = await _ensure_user_doc(user_id, username)
+    u = await _ensure_user(user_id, user.username)
 
-    text = (msg.text or "").strip()
-
-    if text.startswith("/start"):
-        await bot.send_message(user_id, f"👋 Welcome to ANGEL! You get {FREE_LIMIT} free videos. Send any message to receive one.")
+    if msg.text and msg.text.startswith("/start"):
+        await bot.send_message(user_id, "Welcome! Send any message for video.")
         return
 
-    # premium check
-    premium_until = u.get("premium_until")
-    if premium_until:
+    premium = u.get("premium_until")
+    if premium:
         try:
-            if isinstance(premium_until, str):
-                pu = datetime.fromisoformat(premium_until)
-            elif isinstance(premium_until, datetime):
-                pu = premium_until
-            else:
-                pu = None
-            if pu and pu > datetime.utcnow():
-                # unlimited access: send next unseen and return
-                sent = await _send_one_video_with_controls(user_id, u)
+            p = datetime.fromisoformat(premium)
+            if p > datetime.utcnow():
+                # premium active
+                await _send_video(user_id, u)
                 return
-        except Exception:
-            log.exception("Failed to parse premium_until for user %s", user_id)
+        except:
+            pass
 
-    # free-flow handling
     used = u.get("free_used", 0)
     if used < FREE_LIMIT:
-        # send one and increment counter if sent
-        sent_ok = await _send_one_video_with_controls(user_id, u)
-        if sent_ok:
+        if await _send_video(user_id, u):
             await users.update_one({"user_id": user_id}, {"$inc": {"free_used": 1}})
         return
 
-    # free exhausted -> create ad session
-    token, short_url = await create_ad_session(user_id)
-    if not short_url:
-        await bot.send_message(user_id, "Sorry — ad provider temporarily unavailable. Try again in a few moments.")
-        if ADMIN_CHAT_ID:
-            try:
-                await bot.send_message(ADMIN_CHAT_ID, f"Ad session failed: token={token} user={user_id}")
-            except Exception:
-                pass
+    # free over → need ad
+    token, url = await create_ad_session(user_id)
+    if not url:
+        await bot.send_message(user_id, "Ad provider offline, try later.")
         return
 
-    # send one video but with ad buttons shown (user must watch ad)
-    # fetch fresh user doc (to get latest sent_file_ids)
-    u = await users.find_one({"user_id": user_id})
-    await _send_one_video_with_controls(user_id, u or {"user_id": user_id, "sent_file_ids": []}, ad_token=token, ad_short_url=short_url)
+    await _send_video(user_id, u, ad_token=token, ad_url=url)
 
 
-# ---------------- callback handler ----------------
 async def handle_callback(update: Update):
     q = update.callback_query
-    if not q:
-        return
+    data = q.data
+    user_id = q.from_user.id
 
-    data = q.data or ""
-    user = q.from_user
-    user_id = user.id
+    await q.answer()
 
-    try:
-        await q.answer()
-    except Exception:
-        pass
-
-    # Next video button
     if data == "next_video":
-        u = await users.find_one({"user_id": user_id}) or await _ensure_user_doc(user_id, getattr(user, "username", None))
-        # If user exhausted free but not watched ad, still allow next? We'll respect free count: if free_used < FREE_LIMIT send free, else require ad.
+        u = await users.find_one({"user_id": user_id}) or await _ensure_user(user_id)
         used = u.get("free_used", 0)
+
         if used < FREE_LIMIT:
-            sent = await _send_one_video_with_controls(user_id, u)
-            if sent:
+            if await _send_video(user_id, u):
                 await users.update_one({"user_id": user_id}, {"$inc": {"free_used": 1}})
             return
-        else:
-            # require ad: create ad session and send video with ad buttons
-            token, short_url = await create_ad_session(user_id)
-            if not short_url:
-                await q.message.reply_text("Ad provider currently not available. Try again later.")
-                return
-            # send next unseen video but require ad buttons
-            await _send_one_video_with_controls(user_id, u, ad_token=token, ad_short_url=short_url)
-            return
 
-    # Show free count
+        token, url = await create_ad_session(user_id)
+        await _send_video(user_id, u, ad_token=token, ad_url=url)
+        return
+
     if data == "show_free":
-        u = await users.find_one({"user_id": user_id}) or await _ensure_user_doc(user_id, getattr(user, "username", None))
+        u = await users.find_one({"user_id": user_id})
         used = u.get("free_used", 0)
-        remaining = max(0, FREE_LIMIT - used)
-        await q.message.reply_text(f"Free videos used: {used}\nRemaining this cycle: {remaining}")
+        rem = max(0, FREE_LIMIT - used)
+        await q.message.reply_text(f"Used: {used}\nRemaining: {rem}")
         return
 
-    # premium menu
     if data == "premium_menu":
-        # Show plans and a small image (link). If you want a specific image file_id, set env var and code accordingly.
-        photo_url = "https://i.imgur.com/0KXQZ5b.png"  # placeholder image
-        text = "Premium Plans:\n\n• 10 Days – ₹100\n• 20 Days – ₹150\n• 30 Days – ₹200\n\nTo buy premium, contact the admin."
-        try:
-            await q.message.reply_photo(photo=photo_url, caption=text)
-        except Exception:
-            await q.message.reply_text(text)
-        # if ADMIN_CHAT_ID present, show contact instruction
-        if ADMIN_CHAT_ID:
-            try:
-                await q.message.reply_text(f"Contact admin: https://t.me/{ADMIN_CHAT_ID}")
-            except Exception:
-                pass
+        await q.message.reply_text(
+            "Premium:\n10 days ₹100\n20 days ₹150\n30 days ₹200\nContact admin."
+        )
         return
 
-    # Ad verify callback handled elsewhere (ad_check:token)
     if data.startswith("ad_check:"):
         token = data.split(":", 1)[1]
         rec = await ad_sessions.find_one({"token": token})
-        if not rec:
-            await q.answer("Ad session not found.", show_alert=True)
-            return
-        if rec.get("status") == "completed":
-            # reset free counter and allow next videos
+        if rec and rec.get("status") == "completed":
             await users.update_one({"user_id": user_id}, {"$set": {"free_used": 0}})
-            await q.message.reply_text("✅ Ad verified — your free videos are unlocked. Enjoy!")
+            await q.message.reply_text("Ad verified! Free videos restored.")
         else:
-            await q.answer("Ad not verified yet. Click Return to Bot on the ad page and press this button again.", show_alert=True)
-        return
-
-    # fallback
-    await q.answer()
+            await q.answer("Not verified yet. Try again.", show_alert=True)
