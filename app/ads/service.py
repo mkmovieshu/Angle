@@ -1,155 +1,73 @@
 # app/ads/service.py
-import uuid
-import aiohttp
-import urllib.parse
+import os
 import logging
+import uuid
+import httpx
 from datetime import datetime
-from typing import Optional, Tuple, Any, Dict
 
 from app.database import ad_sessions
-from app.config import SHORTX_API_KEY, DOMAIN
+from app.config import SHORTX_API_KEY
 
-log = logging.getLogger("app.ads.service")
-log.setLevel(logging.INFO)
-
-def utcnow() -> datetime:
-    return datetime.utcnow()
+log = logging.getLogger("ads.service")
 
 
-async def create_ad_session(user_id: int) -> Tuple[str, Optional[str]]:
+async def create_ad_session(user_id: int):
     """
-    Create an ad session record and ask ShortXLinks to create a short link.
-    Returns (token, short_url_or_none).
-    Stores provider raw response in ad_sessions.provider_response for debugging.
+    Create an ad session for the user.
+    Returns (token, short_url) or (token, None) if provider unavailable.
+    Stores record in ad_sessions collection with 'completed': False
     """
     token = uuid.uuid4().hex
-    return_url = f"https://{DOMAIN}/ad/return?token={token}&uid={user_id}"
-    params = {
-        "api": SHORTX_API_KEY,
-        "url": return_url,
-        "alias": f"ad{token[:6]}"
-    }
+    short_url = None
 
-    short_api = "https://shortxlinks.com/api?" + urllib.parse.urlencode(params)
+    # Try provider if API key present
+    if SHORTX_API_KEY:
+        try:
+            # Example ShortX API (adjust if yours is different)
+            # We post to their endpoint with api key & destination URL (use a safe fallback)
+            dest = f"https://example.com/ad-landing?token={token}"
+            url = f"https://shortxlinks.com/api"
+            params = {"api": SHORTX_API_KEY, "url": dest}
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.get(url, params=params)
+                if r.status_code == 200:
+                    data = r.json()
+                    if isinstance(data, dict) and data.get("status") in ("success", "ok") and data.get("shortenedUrl"):
+                        short_url = data.get("shortenedUrl")
+                    else:
+                        log.warning("Shortx responded but no usable short_url: %s", data)
+                else:
+                    log.warning("Shortx HTTP %s: %s", r.status_code, r.text)
+        except Exception as e:
+            log.exception("Shortx call failed: %s", e)
 
-    # create DB record first (so we always have token)
-    await ad_sessions.insert_one({
+    # fallback short_url if provider not used
+    if not short_url:
+        # create an internal "virtual" short url you control (front-end not necessary)
+        short_url = f"https://{os.getenv('DOMAIN')}/ad/{token}"
+
+    doc = {
         "token": token,
         "user_id": user_id,
-        "status": "pending",
-        "redirect_url": None,
-        "provider_response": None,
-        "created_at": utcnow(),
-        "completed_at": None
-    })
-
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(short_api, timeout=20) as resp:
-                # try parse JSON; if fails, capture text for debugging
-                try:
-                    js = await resp.json()
-                except Exception:
-                    text = await resp.text()
-                    log.error("ShortX returned non-json response for token=%s: %s", token, text[:1000])
-                    # save raw text and mark failed
-                    await ad_sessions.update_one(
-                        {"token": token},
-                        {"$set": {"status": "failed", "provider_response": text}}
-                    )
-                    return token, None
-
-                # store raw provider response for debugging
-                await ad_sessions.update_one(
-                    {"token": token},
-                    {"$set": {"provider_response": js}}
-                )
-
-                # quick debug log (visible in Render logs)
-                log.error("RAW_SHORTX_RESPONSE token=%s: %s", token, repr(js)[:2000])
-
-                # Normalise and extract a string short_url from many possible shapes.
-                short_url = _extract_short_url(js)
-
-                if not short_url:
-                    log.error("No usable short_url found in provider response for token=%s: %s", token, js)
-                    # mark failed so we don't retry blindly
-                    await ad_sessions.update_one(
-                        {"token": token},
-                        {"$set": {"status": "failed"}}
-                    )
-                    return token, None
-
-                # Save the extracted redirect_url and return it
-                await ad_sessions.update_one(
-                    {"token": token},
-                    {"$set": {"redirect_url": short_url}}
-                )
-                return token, short_url
-
-    except Exception as e:
-        log.exception("Exception while creating ad session for token=%s: %s", token, e)
-        await ad_sessions.update_one(
-            {"token": token},
-            {"$set": {"status": "failed", "provider_response": str(e)}}
-        )
-        return token, None
+        "short_url": short_url,
+        "completed": False,
+        "created_at": datetime.utcnow().isoformat(),
+    }
+    await ad_sessions.insert_one(doc)
+    log.info("Ad session created token=%s user=%s short=%s", token, user_id, short_url)
+    return token, short_url
 
 
-def _extract_short_url(js: Any) -> Optional[str]:
+async def mark_ad_completed(token: str, user_id: int) -> bool:
     """
-    Try many heuristics to pull a usable short link string from the provider response.
-    Return string or None.
+    Mark ad session completed if exists and belongs to user.
+    Returns True if changed from False->True.
     """
-    # if provider returned a string (rare)
-    if isinstance(js, str) and js.strip().startswith("http"):
-        return js.strip()
-
-    # if it's a dict try many known keys
-    if isinstance(js, dict):
-        # direct string keys
-        candidates = ["shortenedUrl", "short_url", "short", "url", "data", "shortlink", "shortId"]
-        for k in candidates:
-            v = js.get(k)
-            if isinstance(v, str) and v.strip().startswith("http"):
-                return v.strip()
-            # sometimes v is nested dict with the actual url
-            if isinstance(v, dict):
-                for kk in ("short", "short_url", "url", "link", "shortenedUrl"):
-                    vv = v.get(kk)
-                    if isinstance(vv, str) and vv.strip().startswith("http"):
-                        return vv.strip()
-        # sometimes response shape: {"data": {"url": "..."}}
-        d = js.get("data")
-        if isinstance(d, dict):
-            for kk in ("short", "url", "link", "short_url"):
-                vv = d.get(kk)
-                if isinstance(vv, str) and vv.strip().startswith("http"):
-                    return vv.strip()
-
-        # some providers embed under top-level 'result' or 'response'
-        for topk in ("result", "response", "value"):
-            topv = js.get(topk)
-            if isinstance(topv, dict):
-                for kk in ("short", "url", "link", "short_url"):
-                    vv = topv.get(kk)
-                    if isinstance(vv, str) and vv.strip().startswith("http"):
-                        return vv.strip()
-
-        # fallback: scan the entire dict values for a string that looks like a url
-        for val in js.values():
-            if isinstance(val, str) and val.strip().startswith("http"):
-                return val.strip()
-
-    # can't find anything usable
-    return None
-
-
-async def mark_ad_completed(token: str) -> None:
-    """
-    Mark ad session as completed. Called by /ad/return endpoint when provider redirects user back.
-    """
-    await ad_sessions.update_one(
-        {"token": token},
-        {"$set": {"status": "completed", "completed_at": utcnow()}}
-    )
+    rec = await ad_sessions.find_one({"token": token, "user_id": user_id})
+    if not rec:
+        return False
+    if rec.get("completed"):
+        return False
+    await ad_sessions.update_one({"token": token}, {"$set": {"completed": True, "completed_at": datetime.utcnow().isoformat()}})
+    log.info("Ad session completed token=%s user=%s", token, user_id)
+    return True
