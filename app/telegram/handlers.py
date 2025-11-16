@@ -1,212 +1,182 @@
 # app/telegram/handlers.py
+import logging
+from datetime import datetime
+from typing import Optional, Dict, Any
 
-import asyncio
 from telegram import Update
-from telegram.constants import ChatMemberStatus
-from telegram.ext import ContextTypes
+from telegram import Message
 
 from app.telegram.bot import bot
-from app.telegram.keyboards import join_group_buttons, video_control_buttons
 from app.telegram.membership import is_user_member
+from app.telegram.video_service import ensure_user_doc, send_one_video
+from app.telegram.keyboards import join_group_buttons, video_control_buttons
+from app.ads.service import create_ad_session
 from app.database import users, videos, ad_sessions
-from app.config import REQUIRED_GROUP_ID, REQUIRED_GROUP_LINK, FREE_LIMIT
+from app.config import FREE_LIMIT, REQUIRED_GROUP_LINK, ADMIN_CHAT_ID
+
+from app.telegram.channel_import import import_channel_post  # NEW
+
+log = logging.getLogger("handlers")
+log.setLevel(logging.INFO)
 
 
-# ============================
-#   FORCE JOIN CHECK
-# ============================
-
-async def handle_update(update: dict):
-    """Main entry from webhook"""
-    if "message" in update:
-        upd = Update.de_json(update, bot)
-        await handle_message(upd, None)
-    elif "callback_query" in update:
-        upd = Update.de_json(update, bot)
-        await handle_callback(upd, None)
-
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    chat_id = user.id
-    text = update.effective_message.text or ""
-
-    # --- FORCE JOIN CHECK START ---
-    member_ok = await is_user_member(chat_id)
-
-    if not member_ok:
-        await bot.send_message(
-            chat_id,
-            "**📌 ముందుగా మా గ్రూప్‌లో Join అవ్వాలి!**\n\n"
-            "➡️ Join చేసి తిరిగి **I Joined** నొక్కండి.",
-            reply_markup=join_group_buttons(REQUIRED_GROUP_LINK),
-            parse_mode="Markdown"
-        )
+async def handle_update(raw_update: dict):
+    """
+    Main entry function used by routes.py when webhook posts an update.
+    This will dispatch channel posts, messages, and callback queries.
+    """
+    try:
+        upd = Update.de_json(raw_update, bot)
+    except Exception as e:
+        log.exception("Invalid update JSON: %s", e)
         return
-    # --- FORCE JOIN CHECK END ---
 
-    # Register user if not exist
-    existing = await users.find_one({"user_id": chat_id})
-    if not existing:
-        await users.insert_one({
-            "user_id": chat_id,
-            "free_used": 0,
-            "premium": False,
-            "premium_expiry": None,
-            "seen_videos": []
-        })
+    # Channel post -> import into DB
+    if upd.channel_post:
+        try:
+            await import_channel_post(upd.channel_post)
+        except Exception:
+            log.exception("channel import failed")
+        return
 
-    # START message
-    if text == "/start":
-        await send_first_video(chat_id)
+    # message -> user flow
+    if upd.message:
+        await handle_message(upd)
+        return
+
+    # callback queries handled elsewhere if present
+    if upd.callback_query:
+        await handle_callback(upd)
         return
 
 
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user = query.from_user
-    chat_id = user.id
-    data = query.data
+# --- helper to get unseen video for user (delegated to video_service) ---
+# send_one_video(user_id, user_doc, ad_token=None, ad_url=None)
 
-    # USER JOIN CHECK
+
+async def handle_message(update: Update):
+    msg = update.message
+    if not msg:
+        return
+
+    user = msg.from_user
+    user_id = user.id
+    username = getattr(user, "username", None)
+
+    # Ensure user doc exists
+    u = await ensure_user_doc(user_id, username)
+
+    text = (msg.text or "").strip()
+
+    # Force join: if not a member, prompt join first
+    if not await is_user_member(user_id):
+        kb = join_group_buttons(REQUIRED_GROUP_LINK)
+        await bot.send_message(user_id, "📌 ముందుగా మా గ్రూప్‌లో Join అవ్వాలి!\nJoin చేసి 'I Joined' నొక్కండి.", reply_markup=kb)
+        return
+
+    # /start handler: welcome message
+    if text.startswith("/start"):
+        await bot.send_message(user_id, f"👋 Welcome to ANGEL! You get {FREE_LIMIT} free videos. Send any message to receive one.")
+        return
+
+    # premium check
+    premium_until = u.get("premium_until")
+    if premium_until:
+        try:
+            pu = datetime.fromisoformat(premium_until) if isinstance(premium_until, str) else premium_until
+            if pu and pu > datetime.utcnow():
+                await send_one_video(user_id, u)
+                return
+        except Exception:
+            log.exception("premium parse fail")
+
+    # free quota
+    used = u.get("free_used", 0)
+    if used < FREE_LIMIT:
+        success = await send_one_video(user_id, u)
+        if success:
+            await users.update_one({"user_id": user_id}, {"$inc": {"free_used": 1}})
+        return
+
+    # free exhausted -> ad session
+    token, short_url = await create_ad_session(user_id)
+    if not short_url:
+        await bot.send_message(user_id, "Sorry — ad provider temporarily unavailable. Try again later.")
+        return
+
+    # ensure still member before sending ad button
+    if not await is_user_member(user_id):
+        kb = join_group_buttons(REQUIRED_GROUP_LINK)
+        await bot.send_message(user_id, "Join required group first to watch more videos.", reply_markup=kb)
+        return
+
+    await send_one_video(user_id, u, ad_token=token, ad_url=short_url)
+
+
+async def handle_callback(update: Update):
+    q = update.callback_query
+    if not q:
+        return
+    data = q.data or ""
+    user_id = q.from_user.id
+    await q.answer()
+
+    # I Joined pressed
     if data == "check_join":
-        ok = await is_user_member(chat_id)
-        if not ok:
-            await query.answer("❌ ఇంకా Join కాలేదమ్మా!", show_alert=True)
-            return
-
-        await query.answer("✅ Joined Confirmed!")
-
-        await send_first_video(chat_id)
+        if await is_user_member(user_id):
+            u = await ensure_user_doc(user_id, getattr(q.from_user, "username", None))
+            await q.message.reply_text("✅ Membership confirmed. Sending video now.")
+            used = u.get("free_used", 0)
+            if used < FREE_LIMIT:
+                sent = await send_one_video(user_id, u)
+                if sent:
+                    await users.update_one({"user_id": user_id}, {"$inc": {"free_used": 1}})
+                return
+            token, short_url = await create_ad_session(user_id)
+            if not short_url:
+                await q.message.reply_text("Ad provider failed. Try later.")
+                return
+            await send_one_video(user_id, u, ad_token=token, ad_url=short_url)
+        else:
+            kb = join_group_buttons(REQUIRED_GROUP_LINK)
+            await q.message.reply_text("We still can't verify membership. Please join and press 'I Joined'.", reply_markup=kb)
         return
 
     # Next video
     if data == "next_video":
-        await query.answer()
-        await send_next_video(chat_id)
+        u = await users.find_one({"user_id": user_id}) or await ensure_user_doc(user_id)
+        used = u.get("free_used", 0)
+        if used < FREE_LIMIT:
+            sent = await send_one_video(user_id, u)
+            if sent:
+                await users.update_one({"user_id": user_id}, {"$inc": {"free_used": 1}})
+            return
+        token, short_url = await create_ad_session(user_id)
+        if not short_url:
+            await q.message.reply_text("Ad provider unavailable. Try later.")
+            return
+        await send_one_video(user_id, u, ad_token=token, ad_url=short_url)
         return
 
-    # Premium Menu
+    # Show free count
+    if data == "show_free":
+        u = await users.find_one({"user_id": user_id}) or await ensure_user_doc(user_id)
+        used = u.get("free_used", 0)
+        await q.message.reply_text(f"Used: {used}\nRemaining: {max(0, FREE_LIMIT - used)}")
+        return
+
+    # Premium menu
     if data == "premium_menu":
-        await query.answer()
-        await show_premium_menu(chat_id)
+        await q.message.reply_text("Premium menu: contact admin to subscribe.")
         return
 
-    # Ad confirm
+    # Ad check token
     if data.startswith("ad_check:"):
-        token = data.split(":")[1]
-        await complete_ad_session(chat_id, token, query)
+        token = data.split(":", 1)[1]
+        rec = await ad_sessions.find_one({"token": token})
+        if rec and rec.get("status") == "completed":
+            await users.update_one({"user_id": user_id}, {"$set": {"free_used": 0}})
+            await q.message.reply_text("Ad verified — free count reset.")
+        else:
+            await q.answer("Not verified yet. Try again after finishing the ad.", show_alert=True)
         return
-
-
-# ============================
-#   VIDEO SYSTEM
-# ============================
-
-async def send_first_video(chat_id: int):
-    user = await users.find_one({"user_id": chat_id})
-    free_used = user.get("free_used", 0)
-
-    next_video = await videos.find_one({"index": free_used})
-    if not next_video:
-        await bot.send_message(chat_id, "❌ No videos found in DB.")
-        return
-
-    await bot.send_video(
-        chat_id,
-        next_video["file_id"],
-        caption=f"🎬 **FREE VIDEO {free_used+1}/{FREE_LIMIT}**",
-        parse_mode="Markdown",
-        reply_markup=video_control_buttons()
-    )
-
-
-async def send_next_video(chat_id: int):
-    user = await users.find_one({"user_id": chat_id})
-    free_used = user["free_used"]
-
-    # FREE LIMIT reached → show Ad required
-    if free_used >= FREE_LIMIT:
-        token, short_url = await create_ad_session(chat_id)
-
-        await bot.send_message(
-            chat_id,
-            "⚠️ **Free limit complete!**\n\n"
-            "➡️ యాడ్ చూడండి తర్వాత మీరు మరో వీడియో చూడొచ్చు.",
-            parse_mode="Markdown",
-            reply_markup=video_control_buttons(token_for_ad=token, ad_short_url=short_url)
-        )
-        return
-
-    next_video = await videos.find_one({"index": free_used})
-    if not next_video:
-        await bot.send_message(chat_id, "❌ No more videos found.")
-        return
-
-    await bot.send_video(
-        chat_id,
-        next_video["file_id"],
-        caption=f"🎬 **FREE VIDEO {free_used+1}/{FREE_LIMIT}**",
-        parse_mode="Markdown",
-        reply_markup=video_control_buttons()
-    )
-
-    await users.update_one(
-        {"user_id": chat_id},
-        {"$inc": {"free_used": 1}}
-    )
-
-
-# ============================
-#   PREMIUM MENU
-# ============================
-
-async def show_premium_menu(chat_id: int):
-    await bot.send_message(
-        chat_id,
-        "⭐ **PREMIUM PLANS** ⭐\n"
-        "— Full access to all videos\n"
-        "— No Ads\n\n"
-        "10 days = ₹49\n"
-        "20 days = ₹79\n"
-        "30 days = ₹99\n\n"
-        "Contact Admin to Upgrade:",
-        parse_mode="Markdown",
-        reply_markup=join_group_buttons("https://t.me/YourAdmin")
-    )
-
-
-# ============================
-#   ADS SYSTEM
-# ============================
-
-async def create_ad_session(chat_id: int):
-    token = str(chat_id) + "_ad"
-    short_url = "https://shortxlinks.in/ad" + token[-4:]  # your generator
-
-    await ad_sessions.insert_one({
-        "user_id": chat_id,
-        "token": token,
-        "short_url": short_url,
-        "completed": False
-    })
-
-    return token, short_url
-
-
-async def complete_ad_session(chat_id: int, token: str, query):
-    ad = await ad_sessions.find_one({"token": token})
-    if not ad or ad.get("completed"):
-        await query.answer("❌ Invalid / Already Used", show_alert=True)
-        return
-
-    await ad_sessions.update_one({"token": token}, {"$set": {"completed": True}})
-    await query.answer("✅ Ad Verified")
-
-    # Reset free limit cycle
-    await users.update_one(
-        {"user_id": chat_id},
-        {"$set": {"free_used": 0}}
-    )
-
-    await send_first_video(chat_id)
