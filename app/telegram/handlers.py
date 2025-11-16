@@ -163,21 +163,19 @@ async def handle_callback(update: Update):
     # Ad check — user clicked "I Watched"
     if data.startswith("ad_check:"):
         token = data.split(":", 1)[1]
-        # mark ad completed in db (auth by token+user)
-        changed = await mark_ad_completed(token, user_id)
-        if not changed:
-            # maybe the record is already completed or doesn't exist
-            rec = await ad_sessions.find_one({"token": token})
-            if not rec:
-                await q.message.reply_text("❌ Ad session not found or expired.")
-                return
-            if rec.get("completed"):
-                # already completed — proceed
-                pass
-            else:
-                # fallback: mark it now anyway
-                await ad_sessions.update_one({"token": token}, {"$set": {"completed": True}})
-        # reset free cycle: set free_used to 0 so user can get next FREE_LIMIT videos
+        rec = await ad_sessions.find_one({"token": token})
+        if not rec:
+            await q.message.reply_text("❌ Ad session not found or expired.")
+            return
+        if not rec.get("completed"):
+            # Not completed yet — ask user to open the ad link and wait for redirect back
+            short_url = rec.get("short_url")
+            reply_text = "We couldn't verify your ad view yet. Please open the Watch Ad link, watch the ad fully, and wait until the provider redirects back. Then click 'I Watched' again."
+            if short_url:
+                reply_text += f"\n\nWatch Ad link: {short_url}"
+            await q.message.reply_text(reply_text)
+            return
+        # completed == True: unlock
         await users.update_one({"user_id": user_id}, {"$set": {"free_used": 0}})
         await q.message.reply_text("✅ Ad verified — unlocking next free videos.")
         # send first video of new cycle
