@@ -1,3 +1,14 @@
+import os
+from pymongo import MongoClient
+from app.config import BOT_TOKEN, OWNER_ID, MONGO_URL, FREE_LIMIT, DOMAIN, BIN_CHANNEL
+from app.telegram.bin_importer import run_import
+
+mongo = MongoClient(MONGO_URL)   # UPDATED
+db = mongo.get_database()
+users = db.get_collection("users")
+videos = db.get_collection("videos")
+
+# … rest of handlers file (unchanged) …
 import logging
 from datetime import datetime
 from pymongo import MongoClient
@@ -5,7 +16,6 @@ from telegram.error import TelegramError
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from app.telegram.bot import bot
-from app.config import MONGO_URL, FREE_LIMIT, DOMAIN
 
 logger = logging.getLogger("uvicorn.error")
 
