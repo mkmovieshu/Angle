@@ -6,7 +6,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN required in env")
 
-MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017/video_web_bot")
+MONGO_URL = os.getenv("MONGO_URL", "")
 BIN_CHANNEL = int(os.getenv("BIN_CHANNEL", "0"))  # channel id where videos are stored
 DOMAIN = os.getenv("DOMAIN", "").rstrip("/")  # e.g. https://angle-jldx.onrender.com
 SHORTX_API = os.getenv("SHORTX_API", "")  # optional shortener api token
