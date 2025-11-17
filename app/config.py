@@ -30,3 +30,8 @@ PREMIUM_PLANS = {
 # helper
 def premium_expires_at(days: int):
     return datetime.utcnow() + timedelta(days=days)
+    BIN_CHANNEL = os.getenv("BIN_CHANNEL")
+try:
+    BIN_CHANNEL = int(BIN_CHANNEL)
+except Exception:
+    BIN_CHANNEL = BIN_CHANNEL  # keep username string if not integer
