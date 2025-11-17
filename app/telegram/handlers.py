@@ -10,14 +10,13 @@ from app.config import MONGO_URI, FREE_LIMIT, DOMAIN
 logger = logging.getLogger("uvicorn.error")
 
 # -----------------------------
-# Mongo Setup (fixed)
+# MongoDB setup
 # -----------------------------
 client = MongoClient(MONGO_URI)
 
 try:
     default_db = client.get_default_database()
-except Exception as e:
-    logger.warning("get_default_database() failed, using fallback DB")
+except Exception:
     default_db = None
 
 db = default_db if default_db is not None else client["video_web_bot"]
@@ -26,11 +25,11 @@ users = db.users
 videos = db.videos
 ad_sessions = db.ad_sessions
 
-
 # -----------------------------
-# DB Helpers
+# DB helpers
 # -----------------------------
 def ensure_user(user_id: int):
+    """Ensure user doc exists; return it."""
     u = users.find_one({"user_id": user_id})
     if not u:
         users.insert_one({
@@ -39,10 +38,12 @@ def ensure_user(user_id: int):
             "premium": False,
             "created_at": datetime.utcnow(),
         })
-    return users.find_one({"user_id": user_id})
+        u = users.find_one({"user_id": user_id})
+    return u
 
 
 def create_ad_session(user_id: int):
+    """Create an ad session token and store it."""
     token = f"{user_id}-{int(datetime.utcnow().timestamp())}"
     ad_sessions.insert_one({
         "user_id": user_id,
@@ -54,15 +55,16 @@ def create_ad_session(user_id: int):
 
 
 def mark_ad_completed(token: str):
+    """Mark ad session completed. Returns updated doc or None."""
     return ad_sessions.find_one_and_update(
         {"token": token},
-        {"$set": {"completed": True}},
+        {"$set": {"completed": True, "completed_at": datetime.utcnow()}},
         return_document=True
     )
 
 
 # -----------------------------
-# Messaging Helpers
+# Messaging helpers
 # -----------------------------
 async def send(chat_id, text, kb=None):
     try:
@@ -73,38 +75,77 @@ async def send(chat_id, text, kb=None):
             parse_mode="HTML"
         )
     except TelegramError:
-        logger.exception("Send message failed")
+        logger.exception("send() failed for chat_id=%s", chat_id)
 
 
 # -----------------------------
-# Callback Handler
+# Callback handling
 # -----------------------------
 async def handle_callback(q):
+    """
+    callback_query payload expected shape:
+    {
+      "id": "...",
+      "from": {...},
+      "message": {...},
+      "data": "..."
+    }
+    """
     data = q.get("data", "")
     user_id = q["from"]["id"]
     chat_id = q["message"]["chat"]["id"]
 
-    user = ensure_user(user_id)
+    ensure_user(user_id)
 
-    # ------------------------
-    # FREE VIDEO REQUEST
-    # ------------------------
+    # free video request
     if data == "free_video":
-        if user["free_watched"] >= FREE_LIMIT:
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("Watch Ad", callback_data="watch_ad")],
-                [InlineKeyboardButton("Buy Premium", url=f"{DOMAIN}/buy")]
-            ])
-            await send(chat_id, "Free limit reached! Watch Ad to continue.", kb)
+        u = users.find_one({"user_id": user_id})
+        if u.get("premium"):
+            # premium users: unlimited
+            await send(chat_id, "You are premium — sending a video...")
+            # send first matching video (example)
+            v = videos.find_one({})
+            if v:
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Next ▶", callback_data=f"next:0:all")],
+                ])
+                try:
+                    await bot.send_video(chat_id, v["file_id"], caption=v.get("title", ""), reply_markup=kb)
+                except TelegramError:
+                    await send(chat_id, v.get("title", "Video"), kb)
+            else:
+                await send(chat_id, "No videos in bin channel.")
             return
 
+        # non-premium: check free count
+        u = users.find_one({"user_id": user_id})
+        free_watched = u.get("free_watched", 0)
+        if free_watched >= FREE_LIMIT:
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("Watch Ad", callback_data="watch_ad")],
+                [InlineKeyboardButton("Buy Premium 💎", url=f"{DOMAIN}/buy")]
+            ])
+            await send(chat_id, "Free limit reached. Watch an ad or buy premium.", kb)
+            return
+
+        # increment and send a video
         users.update_one({"user_id": user_id}, {"$inc": {"free_watched": 1}})
-        await send(chat_id, f"Here is your free video #{user['free_watched'] + 1}")
+        v = videos.find_one({})
+        if not v:
+            await send(chat_id, "No videos available.")
+            return
+
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Next ▶", callback_data=f"next:0:all")],
+            [InlineKeyboardButton("Watch Ad", callback_data="watch_ad")]
+        ])
+        try:
+            await bot.send_video(chat_id, v["file_id"], caption=v.get("title", ""), reply_markup=kb)
+        except TelegramError:
+            await send(chat_id, v.get("title", "Video"), kb)
         return
 
-    # ------------------------
-    # AD START
-    # ------------------------
+    # watch ad: create ad session and give short link/button
     if data == "watch_ad":
         token = create_ad_session(user_id)
         ad_url = f"{DOMAIN}/ad/{token}"
@@ -112,126 +153,122 @@ async def handle_callback(q):
             [InlineKeyboardButton("Open Ad", url=ad_url)],
             [InlineKeyboardButton("I Watched Ad", callback_data=f"ad_done:{token}")]
         ])
-        await send(chat_id, "Watch this ad fully and then click below:", kb)
+        await send(chat_id, "Open the ad, watch fully, then press 'I Watched Ad'.", kb)
         return
 
-    # ------------------------
-    # AD FINISHED
-    # ------------------------
+    # user clicked 'I Watched Ad' - verify session
     if data.startswith("ad_done:"):
-        token = data.split(":")[1]
-        s = ad_sessions.find_one({"token": token})
-
-        if not s or not s.get("completed"):
-            await send(chat_id, "You didn’t finish the ad. Watch fully!")
+        token = data.split(":", 1)[1]
+        sess = ad_sessions.find_one({"token": token})
+        if not sess:
+            await send(chat_id, "Ad session not found. Please open the ad first.")
             return
 
-        await send(chat_id, "Ad verified! You can continue watching videos.")
+        # If the external ad verification updates this session.completed=True,
+        # we require that to be true here. If your ad provider returns a callback
+        # to your webserver to mark it completed, this check will pass.
+        if not sess.get("completed"):
+            await send(chat_id, "Ad not verified yet. Make sure you watched the ad and returned to the bot.")
+            return
+
+        # mark complete again just in case and allow the user to continue
+        mark_ad_completed(token)
+        # reset free_watched so user can continue (adjust logic as needed)
+        users.update_one({"user_id": user_id}, {"$set": {"free_watched": 0}})
+        await send(chat_id, "Ad verified — you can continue watching free videos.")
         return
 
-    # ------------------------
-    # NEXT: index:query
-    # ------------------------
+    # pagination/next handler: data format "next:{index}:{query}"
     if data.startswith("next:"):
-        _, index, query = data.split(":", 2)
-        index = int(index) + 1
+        try:
+            _, index_s, query = data.split(":", 2)
+            index = int(index_s)
+        except Exception:
+            await send(chat_id, "Invalid next request.")
+            return
 
-        result = list(videos.find({"title": {"$regex": query, "$options": "i"}}).skip(index).limit(1))
+        # select next video based on query; 'all' returns from start+index
+        if query == "all":
+            cursor = videos.find({}).skip(index).limit(1)
+        else:
+            cursor = videos.find({"title": {"$regex": query, "$options": "i"}}).skip(index).limit(1)
+
+        result = list(cursor)
         if not result:
             await send(chat_id, "No more videos.")
             return
 
         vid = result[0]
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Next ▶", callback_data=f"next:{index}:{query}")],
+            [InlineKeyboardButton("Next ▶", callback_data=f"next:{index+1}:{query}")],
             [InlineKeyboardButton("Watch Ad", callback_data="watch_ad")]
         ])
-
         try:
-            await bot.send_video(chat_id, vid["file_id"], caption=vid["title"], reply_markup=kb)
-        except:
-            await send(chat_id, vid["title"], kb)
-
+            await bot.send_video(chat_id, vid["file_id"], caption=vid.get("title", ""), reply_markup=kb)
+        except TelegramError:
+            await send(chat_id, vid.get("title", "Video"), kb)
         return
 
 
 # -----------------------------
-# Message Handler
+# Message handling
 # -----------------------------
 async def handle_message(update):
-    msg = update.get("message", {})
-    text = msg.get("text", "")
-    user_id = msg.get("from", {}).get("id")
-    chat_id = msg.get("chat", {}).get("id")
+    """
+    update = {"message": {...}} expected.
+    """
+    msg = update.get("message", {}) or {}
+    text = msg.get("text", "") or ""
+    from_user = msg.get("from", {}) or {}
+    user_id = from_user.get("id")
+    chat = msg.get("chat", {}) or {}
+    chat_id = chat.get("id")
 
-    if not user_id:
+    if not user_id or not chat_id:
         return
 
     ensure_user(user_id)
 
+    # /start
     if text.startswith("/start"):
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("Free Video ▶", callback_data="free_video")],
             [InlineKeyboardButton("Buy Premium 💎", url=f"{DOMAIN}/buy")]
         ])
-        await send(chat_id, f"Welcome! Free limit: {FREE_LIMIT}", kb)
+        await send(chat_id, f"Welcome — free limit: {FREE_LIMIT}.", kb)
         return
 
-    # SEARCH
-    if text.strip():
-        result = list(videos.find({"title": {"$regex": text, "$options": "i"}}).limit(1))
+    # any text -> treat as search query (first result)
+    q = text.strip()
+    if q:
+        result = list(videos.find({"title": {"$regex": q, "$options": "i"}}).limit(1))
         if not result:
-            await send(chat_id, "No results.")
+            await send(chat_id, "No results found.")
             return
 
         vid = result[0]
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Next ▶", callback_data=f"next:0:{text}")],
+            [InlineKeyboardButton("Next ▶", callback_data=f"next:0:{q}")],
             [InlineKeyboardButton("Watch Ad", callback_data="watch_ad")]
         ])
-
         try:
-            await bot.send_video(chat_id, vid["file_id"], caption=vid["title"], reply_markup=kb)
-        except:
-            await send(chat_id, vid["title"], kb)
+            await bot.send_video(chat_id, vid["file_id"], caption=vid.get("title", ""), reply_markup=kb)
+        except TelegramError:
+            await send(chat_id, vid.get("title", "Video"), kb)
 
 
 # -----------------------------
-# MAIN ENTRY (used by routes.py)
+# Top-level entry used by routes.py
 # -----------------------------
 async def handle_update(update):
+    # update may contain "callback_query" or "message"
     if "callback_query" in update:
         await handle_callback(update["callback_query"])
         return
 
-    await handle_message(update)a clickable URL
-            ad = create_ad_session(user_id=user_id, provider=None, dest_url=None)
-            token = ad.get("token")
-            url = f"{DOMAIN}/ad/redirect/{token}" if DOMAIN else None
-            if url:
-                await bot.send_message(chat_id=chat_id, text=f"Please open this link to watch ad and return: {url}")
-            else:
-                await bot.send_message(chat_id=chat_id, text="Unable to create ad link right now. Contact admin.")
-            return
-        if data_payload == "get_premium":
-            # show plan buttons with admin contact
-            kb = premium_plan_buttons(ADMIN_CONTACT)
-            await bot.send_message(chat_id=chat_id, text="Choose a premium plan or contact admin to buy.", reply_markup=kb)
-            return
-        if data_payload.startswith("buy_"):
-            plan = data_payload.split("_", 1)[1]
-            # map to days
-            days = {"10": 10, "20": 20, "30": 30}.get(plan)
-            if days:
-                # instruct to contact admin or pay via UPI — simplified flow
-                await bot.send_message(chat_id=chat_id, text=f"To buy {days} days premium, contact admin: https://t.me/{ADMIN_CONTACT.lstrip('@')}")
-            else:
-                await bot.send_message(chat_id=chat_id, text="Invalid plan.")
-            return
+    if "message" in update:
+        await handle_message(update)
+        return
 
-    # ignore other update types for now
-    return
-
-# Optionally: a small endpoint handler (not used here) that gets called when ad provider redirects back
-# Example: when user finishes ad, provider redirects to /ad/complete/<token> which would call mark_ad_completed(token)
-# You already have ads/service.create_ad_session — ensure that route marks completed and triggers giving next videos.
+    # unknown update - ignore
+    logger.debug("Unhandled update type: %s", update.keys())
