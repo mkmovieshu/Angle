@@ -1,55 +1,53 @@
 # app/routes.py
-from fastapi import APIRouter, Request, HTTPException
-from fastapi.responses import PlainTextResponse, JSONResponse
 import logging
-import asyncio
+import sys
+import traceback
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
 
-logger = logging.getLogger(__name__)
+from app.telegram.handlers import handle_update  # ensure this exists
+from app.config import DOMAIN
 
-router = APIRouter()
+logger = logging.getLogger("uvicorn.error")
 
-# try import the project's telegram update handler (adjust name if your repo uses different)
-try:
-    from app.telegram.handlers import handle_update  # must exist in your handlers.py
-except Exception as e:
-    logger.exception("Could not import handle_update from app.telegram.handlers: %s", e)
-    # create a fallback stub so import of this module doesn't fail; will raise at runtime if used
-    async def handle_update(data):
-        raise RuntimeError("handle_update not available: " + str(e))
+app = FastAPI()
 
-@router.get("/", response_class=PlainTextResponse)
+@app.get("/")
 async def root():
-    return "ANGEL service ok"
+    return {"ok": True, "message": "ANGEL service is alive."}
 
-@router.get("/healthz", response_class=PlainTextResponse)
-async def healthz():
-    return "ok"
-
-@router.post("/webhook")
+@app.post("/webhook")
 async def webhook(request: Request):
     """
-    Endpoint for Telegram webhook.
-    Forwards the parsed JSON body to `handle_update`.
+    Telegram will POST updates here.
+    We parse JSON and forward to handle_update(data).
+    Always return a 200 to Telegram unless something fatal happens.
     """
     try:
         data = await request.json()
-    except Exception:
-        # If body isn't JSON, return 400
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    except Exception as exc:
+        logger.exception("Invalid JSON received on /webhook")
+        # Bad request from client
+        raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    # handle_update may be sync or async; support both
+    # Defensive: ensure handle_update is present and callable
+    if not callable(handle_update):
+        msg = "handle_update not available or not callable."
+        logger.error(msg)
+        raise HTTPException(status_code=500, detail=msg)
+
+    # Call handler and catch errors so Telegram gets 200 (or controlled 500)
     try:
-        if asyncio.iscoroutinefunction(handle_update):
-            await handle_update(data)
-        else:
-            # run sync function in threadpool to avoid blocking
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, handle_update, data)
-    except Exception as ex:
-        # log full exception and return 500 so Telegram sees an error (useful for debugging)
-        logger.exception("Error while handling update: %s", ex)
-        # return 200 if you want Telegram to stop retrying; for debugging keep 500.
-        # Here we return 500 so you see the error in logs during development.
-        return JSONResponse(status_code=500, content={"ok": False, "error": str(ex)})
+        await handle_update(data)
+    except Exception as exc:
+        # Log full traceback for debugging
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        logger.error("Error while handling update: %s\n%s", exc, tb)
 
-    return JSONResponse(content={"ok": True})
+        # Return 200 to Telegram if you want to ack (so it won't retry endlessly).
+        # But return 500 if you prefer Telegram to retry. We'll return 500 so you see the error in logs.
+        # If you want Telegram to stop retries, change status_code to 200.
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(exc)})
+
+    # success
+    return JSONResponse(status_code=200, content={"ok": True})
