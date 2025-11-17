@@ -5,14 +5,14 @@ from telegram.error import TelegramError
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from app.telegram.bot import bot
-from app.config import MONGO_URI, FREE_LIMIT, DOMAIN
+from app.config import MONGO_URL, FREE_LIMIT, DOMAIN
 
 logger = logging.getLogger("uvicorn.error")
 
 # -----------------------------
 # MongoDB setup
 # -----------------------------
-client = MongoClient(MONGO_URI)
+client = MongoClient(MONGO_URL)
 
 try:
     default_db = client.get_default_database()
