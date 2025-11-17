@@ -24,7 +24,7 @@ DB_NAME = os.getenv("MONGO_DB_NAME", "video_bot_db")
 FREE_LIMIT = int(os.getenv("FREE_LIMIT", "5"))
 
 REQUIRED_GROUP_ID = os.getenv("REQUIRED_GROUP_ID")  # optional
-REQUIRED_GROUP_LINK = os.getenv("REQUIRED_GROUP_LINK", "https://t.me/your_group")
+REQUIRED_GROUP_LINK = os.getenv("REQUIRED_GROUP_LINK", "")
 
 # Optional ad provider URL shown to user (replace with real short link provider if available)
 AD_PROVIDER_URL = os.getenv("AD_PROVIDER_URL", REQUIRED_GROUP_LINK)
