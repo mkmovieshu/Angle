@@ -272,3 +272,12 @@ async def handle_update(update):
 
     # unknown update - ignore
     logger.debug("Unhandled update type: %s", update.keys())
+# handlers.py add near top imports
+from app.telegram.bin_importer import run_import
+
+# మరియు ఎక్కడైనా admin-only command లేదా startup hook లో
+# ఉదాహరణ: ఈ ఫంక్షన్ admin request తో కలుసుకో
+async def admin_import_bin(update, context):
+    # only allow admin
+    inserted = run_import(limit=200)
+    await bot.send_message(ADMIN_CHAT_ID, f"Imported {inserted} videos from BIN channel.")
