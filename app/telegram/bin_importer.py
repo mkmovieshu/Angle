@@ -16,7 +16,7 @@ API_HASH = os.getenv("API_HASH")
 STRING_SESSION = os.getenv("STRING_SESSION")  # optional, recommended to keep
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BIN_CHANNEL = os.getenv("BIN_CHANNEL")  # can be '@username' or '-100123...'
-MONGO_URI = os.getenv("MONGO_URI")
+MONGO_URL = os.getenv("MONGO_URI")
 
 if not MONGO_URI:
     raise RuntimeError("MONGO_URI required in env")
