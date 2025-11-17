@@ -1,293 +1,355 @@
+# app/telegram/handlers.py
 import os
-from pymongo import MongoClient
-from app.config import BOT_TOKEN, OWNER_ID, MONGO_URL, FREE_LIMIT, DOMAIN, BIN_CHANNEL
-from app.telegram.bin_importer import run_import
-
-mongo = MongoClient(MONGO_URL)   # UPDATED
-db = mongo.get_database()
-users = db.get_collection("users")
-videos = db.get_collection("videos")
-
-# … rest of handlers file (unchanged) …
 import logging
-from datetime import datetime
-from pymongo import MongoClient
+import traceback
+from typing import Dict, Any, Optional
+
+from telegram import (
+    Bot,
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 from telegram.error import TelegramError
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
 
-from app.telegram.bot import bot
+from pymongo import MongoClient
 
-logger = logging.getLogger("uvicorn.error")
+# ---- Config from env ----
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+MONGO_URL = os.getenv("MONGO_URL")  # you wanted MONGO_URL, not MONGO_URI
+BIN_CHANNEL = int(os.getenv("BIN_CHANNEL", "0"))  # channel id where videos are forwarded
+FREE_LIMIT = int(os.getenv("FREE_LIMIT", "5"))  # number of free videos before ad gating
+DOMAIN = os.getenv("DOMAIN", "")  # optional, used in links
 
-# -----------------------------
-# MongoDB setup
-# -----------------------------
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN required in env")
+if not MONGO_URL:
+    raise RuntimeError("MONGO_URL required in env")
+if not BIN_CHANNEL:
+    logging.warning("BIN_CHANNEL not set (or set to 0) - bin importer won't work until set")
+
+# ---- Bot & DB init ----
+bot = Bot(token=BOT_TOKEN)
 client = MongoClient(MONGO_URL)
+db = client.get_default_database()  # expects a DB in the URL or uses default DB name
+# Collections used:
+users_col = db.get_collection("users")
+videos_col = db.get_collection("bin_videos")  # bin_importer should populate this
 
-try:
-    default_db = client.get_default_database()
-except Exception:
-    default_db = None
+# ---- Logging ----
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger(__name__)
 
-db = default_db if default_db is not None else client["video_web_bot"]
 
-users = db.users
-videos = db.videos
-ad_sessions = db.ad_sessions
+# -------------------------
+# Utilities
+# -------------------------
+def _make_main_keyboard():
+    kb = [
+        [InlineKeyboardButton("🎬 Videos", callback_data="open_videos")],
+        [InlineKeyboardButton("ℹ️ Help", callback_data="help")],
+    ]
+    return InlineKeyboardMarkup(kb)
 
-# -----------------------------
-# DB helpers
-# -----------------------------
-def ensure_user(user_id: int):
-    """Ensure user doc exists; return it."""
-    u = users.find_one({"user_id": user_id})
+
+def _make_video_controls(index: int, total: int, show_next: bool = True):
+    kb = []
+    if show_next:
+        kb.append(InlineKeyboardButton("▶️ Next", callback_data=f"next|{index}"))
+    kb.append(InlineKeyboardButton("🔖 My Status", callback_data="status"))
+    return InlineKeyboardMarkup([kb])
+
+
+def get_user_state(user_id: int) -> Dict[str, Any]:
+    u = users_col.find_one({"user_id": user_id})
     if not u:
-        users.insert_one({
+        u = {
             "user_id": user_id,
-            "free_watched": 0,
-            "premium": False,
-            "created_at": datetime.utcnow(),
-        })
-        u = users.find_one({"user_id": user_id})
+            "video_index": 0,
+            "ads_watched": 0,
+        }
+        users_col.insert_one(u)
     return u
 
 
-def create_ad_session(user_id: int):
-    """Create an ad session token and store it."""
-    token = f"{user_id}-{int(datetime.utcnow().timestamp())}"
-    ad_sessions.insert_one({
-        "user_id": user_id,
-        "token": token,
-        "completed": False,
-        "created_at": datetime.utcnow()
-    })
-    return token
+def set_user_state(user_id: int, **fields):
+    users_col.update_one({"user_id": user_id}, {"$set": fields}, upsert=True)
 
 
-def mark_ad_completed(token: str):
-    """Mark ad session completed. Returns updated doc or None."""
-    return ad_sessions.find_one_and_update(
-        {"token": token},
-        {"$set": {"completed": True, "completed_at": datetime.utcnow()}},
-        return_document=True
-    )
+def increment_user_index(user_id: int, delta: int = 1):
+    users_col.update_one({"user_id": user_id}, {"$inc": {"video_index": delta}}, upsert=True)
 
 
-# -----------------------------
-# Messaging helpers
-# -----------------------------
-async def send(chat_id, text, kb=None):
+# -------------------------
+# Core behavior
+# -------------------------
+async def handle_update(raw_update: Dict[str, Any]):
+    """
+    Entrypoint used by routes.py -> handle_update(data)
+    raw_update is the update JSON from Telegram (webhook).
+    """
     try:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            reply_markup=kb,
-            parse_mode="HTML"
-        )
-    except TelegramError:
-        logger.exception("send() failed for chat_id=%s", chat_id)
-
-
-# -----------------------------
-# Callback handling
-# -----------------------------
-async def handle_callback(q):
-    """
-    callback_query payload expected shape:
-    {
-      "id": "...",
-      "from": {...},
-      "message": {...},
-      "data": "..."
-    }
-    """
-    data = q.get("data", "")
-    user_id = q["from"]["id"]
-    chat_id = q["message"]["chat"]["id"]
-
-    ensure_user(user_id)
-
-    # free video request
-    if data == "free_video":
-        u = users.find_one({"user_id": user_id})
-        if u.get("premium"):
-            # premium users: unlimited
-            await send(chat_id, "You are premium — sending a video...")
-            # send first matching video (example)
-            v = videos.find_one({})
-            if v:
-                kb = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("Next ▶", callback_data=f"next:0:all")],
-                ])
-                try:
-                    await bot.send_video(chat_id, v["file_id"], caption=v.get("title", ""), reply_markup=kb)
-                except TelegramError:
-                    await send(chat_id, v.get("title", "Video"), kb)
-            else:
-                await send(chat_id, "No videos in bin channel.")
-            return
-
-        # non-premium: check free count
-        u = users.find_one({"user_id": user_id})
-        free_watched = u.get("free_watched", 0)
-        if free_watched >= FREE_LIMIT:
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("Watch Ad", callback_data="watch_ad")],
-                [InlineKeyboardButton("Buy Premium 💎", url=f"{DOMAIN}/buy")]
-            ])
-            await send(chat_id, "Free limit reached. Watch an ad or buy premium.", kb)
-            return
-
-        # increment and send a video
-        users.update_one({"user_id": user_id}, {"$inc": {"free_watched": 1}})
-        v = videos.find_one({})
-        if not v:
-            await send(chat_id, "No videos available.")
-            return
-
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Next ▶", callback_data=f"next:0:all")],
-            [InlineKeyboardButton("Watch Ad", callback_data="watch_ad")]
-        ])
-        try:
-            await bot.send_video(chat_id, v["file_id"], caption=v.get("title", ""), reply_markup=kb)
-        except TelegramError:
-            await send(chat_id, v.get("title", "Video"), kb)
+        update = Update.de_json(raw_update, bot)
+    except Exception as e:
+        log.exception("Failed to parse Update")
         return
 
-    # watch ad: create ad session and give short link/button
-    if data == "watch_ad":
-        token = create_ad_session(user_id)
-        ad_url = f"{DOMAIN}/ad/{token}"
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Open Ad", url=ad_url)],
-            [InlineKeyboardButton("I Watched Ad", callback_data=f"ad_done:{token}")]
-        ])
-        await send(chat_id, "Open the ad, watch fully, then press 'I Watched Ad'.", kb)
-        return
-
-    # user clicked 'I Watched Ad' - verify session
-    if data.startswith("ad_done:"):
-        token = data.split(":", 1)[1]
-        sess = ad_sessions.find_one({"token": token})
-        if not sess:
-            await send(chat_id, "Ad session not found. Please open the ad first.")
-            return
-
-        # If the external ad verification updates this session.completed=True,
-        # we require that to be true here. If your ad provider returns a callback
-        # to your webserver to mark it completed, this check will pass.
-        if not sess.get("completed"):
-            await send(chat_id, "Ad not verified yet. Make sure you watched the ad and returned to the bot.")
-            return
-
-        # mark complete again just in case and allow the user to continue
-        mark_ad_completed(token)
-        # reset free_watched so user can continue (adjust logic as needed)
-        users.update_one({"user_id": user_id}, {"$set": {"free_watched": 0}})
-        await send(chat_id, "Ad verified — you can continue watching free videos.")
-        return
-
-    # pagination/next handler: data format "next:{index}:{query}"
-    if data.startswith("next:"):
-        try:
-            _, index_s, query = data.split(":", 2)
-            index = int(index_s)
-        except Exception:
-            await send(chat_id, "Invalid next request.")
-            return
-
-        # select next video based on query; 'all' returns from start+index
-        if query == "all":
-            cursor = videos.find({}).skip(index).limit(1)
+    try:
+        # Message handlers
+        if update.message:
+            await _handle_message(update.message)
+        elif update.callback_query:
+            await _handle_callback(update.callback_query)
         else:
-            cursor = videos.find({"title": {"$regex": query, "$options": "i"}}).skip(index).limit(1)
-
-        result = list(cursor)
-        if not result:
-            await send(chat_id, "No more videos.")
-            return
-
-        vid = result[0]
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Next ▶", callback_data=f"next:{index+1}:{query}")],
-            [InlineKeyboardButton("Watch Ad", callback_data="watch_ad")]
-        ])
-        try:
-            await bot.send_video(chat_id, vid["file_id"], caption=vid.get("title", ""), reply_markup=kb)
-        except TelegramError:
-            await send(chat_id, vid.get("title", "Video"), kb)
-        return
+            log.info("Unhandled update type: %s", type(update))
+    except Exception as e:
+        log.error("Error handling update: %s", e)
+        log.debug(traceback.format_exc())
 
 
-# -----------------------------
-# Message handling
-# -----------------------------
-async def handle_message(update):
-    """
-    update = {"message": {...}} expected.
-    """
-    msg = update.get("message", {}) or {}
-    text = msg.get("text", "") or ""
-    from_user = msg.get("from", {}) or {}
-    user_id = from_user.get("id")
-    chat = msg.get("chat", {}) or {}
-    chat_id = chat.get("id")
-
-    if not user_id or not chat_id:
-        return
-
-    ensure_user(user_id)
+async def _handle_message(message: Message):
+    user_id = message.from_user.id
+    text = message.text or ""
+    chat_id = message.chat.id
 
     # /start
     if text.startswith("/start"):
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Free Video ▶", callback_data="free_video")],
-            [InlineKeyboardButton("Buy Premium 💎", url=f"{DOMAIN}/buy")]
-        ])
-        await send(chat_id, f"Welcome — free limit: {FREE_LIMIT}.", kb)
+        await bot.send_message(
+            chat_id=chat_id,
+            text=f"👋 Hi {message.from_user.first_name}!\n\nWelcome — use the menu below.",
+            reply_markup=_make_main_keyboard(),
+            parse_mode=ParseMode.HTML,
+        )
         return
 
-    # any text -> treat as search query (first result)
-    q = text.strip()
-    if q:
-        result = list(videos.find({"title": {"$regex": q, "$options": "i"}}).limit(1))
-        if not result:
-            await send(chat_id, "No results found.")
+    # If user types Videos (some clients) fallback
+    if text.lower().strip() in ("videos", "video", "🎬 videos"):
+        # emulate button press
+        await _open_videos_for_user(user_id=user_id, chat_id=chat_id)
+        return
+
+    # unknown text -> show menu
+    await bot.send_message(
+        chat_id=chat_id,
+        text="I didn't understand. Choose from the menu.",
+        reply_markup=_make_main_keyboard(),
+    )
+
+
+# -------------------------
+# Callback handling
+# -------------------------
+async def _handle_callback(query):
+    data = query.data or ""
+    user = query.from_user
+    chat_id = query.message.chat.id
+
+    try:
+        if data == "open_videos":
+            await query.answer()  # remove 'loading'
+            await _open_videos_for_user(user_id=user.id, chat_id=chat_id)
             return
 
-        vid = result[0]
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Next ▶", callback_data=f"next:0:{q}")],
-            [InlineKeyboardButton("Watch Ad", callback_data="watch_ad")]
-        ])
+        if data.startswith("next|"):
+            # format: next|<last_sent_index>
+            try:
+                _, prev_index = data.split("|", 1)
+                prev_index = int(prev_index)
+            except Exception:
+                prev_index = None
+            await query.answer()
+            await _send_next_video(user.id, chat_id, prev_sent_index=prev_index)
+            return
+
+        if data == "status":
+            u = get_user_state(user.id)
+            await query.answer()
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"📊 Your status:\n• Videos viewed (index): {u.get('video_index',0)}\n• Ads watched: {u.get('ads_watched',0)}",
+            )
+            return
+
+        if data == "help":
+            await query.answer()
+            await bot.send_message(
+                chat_id=chat_id,
+                text="Help: Click Videos → then Next to navigate. After free limit you'll be asked to watch an ad.",
+            )
+            return
+
+        # unknown callback
+        await query.answer("Unknown action", show_alert=False)
+    except TelegramError as te:
+        log.exception("Telegram error in callback: %s", te)
         try:
-            await bot.send_video(chat_id, vid["file_id"], caption=vid.get("title", ""), reply_markup=kb)
-        except TelegramError:
-            await send(chat_id, vid.get("title", "Video"), kb)
+            await query.answer("Action failed")
+        except Exception:
+            pass
+    except Exception:
+        log.exception("Unhandled callback exception")
 
 
-# -----------------------------
-# Top-level entry used by routes.py
-# -----------------------------
-async def handle_update(update):
-    # update may contain "callback_query" or "message"
-    if "callback_query" in update:
-        await handle_callback(update["callback_query"])
+# -------------------------
+# Video serving logic
+# -------------------------
+def _get_videos_for_bin(limit: int = 100):
+    """
+    Return ordered list of video docs from videos_col for BIN_CHANNEL.
+    Each doc expected to have at least: { 'file_id': str, 'caption': str (opt), 'date': <ts> }
+    """
+    query = {"channel_id": BIN_CHANNEL} if BIN_CHANNEL else {}
+    cursor = videos_col.find(query).sort("date", -1).limit(limit)
+    return list(cursor)
+
+
+async def _open_videos_for_user(user_id: int, chat_id: int):
+    """
+    Called when user opens the videos menu.
+    Resets index for the user (optional) or continues from stored index.
+    Sends the first video (according to user.video_index).
+    """
+    u = get_user_state(user_id)
+    # ensure videos exist
+    vids = _get_videos_for_bin(limit=500)
+    if not vids:
+        await bot.send_message(chat_id=chat_id, text="No videos found right now. Admin, check importer.")
         return
 
-    if "message" in update:
-        await handle_message(update)
+    # send the current video for this user
+    index = int(u.get("video_index", 0))
+    if index >= len(vids):
+        # reached end -> reset or inform
+        await bot.send_message(chat_id=chat_id, text="You've reached the end of available videos.")
         return
 
-    # unknown update - ignore
-    logger.debug("Unhandled update type: %s", update.keys())
-# handlers.py add near top imports
-from app.telegram.bin_importer import run_import
+    # check free limit gating
+    if index >= FREE_LIMIT:
+        # need ad gating
+        await _prompt_watch_ad(user_id, chat_id)
+        return
 
-# మరియు ఎక్కడైనా admin-only command లేదా startup hook లో
-# ఉదాహరణ: ఈ ఫంక్షన్ admin request తో కలుసుకో
-async def admin_import_bin(update, context):
-    # only allow admin
-    inserted = run_import(limit=200)
-    await bot.send_message(ADMIN_CHAT_ID, f"Imported {inserted} videos from BIN channel.")
+    # send the video at index
+    vid = vids[index]
+    await _send_video_doc(chat_id, vid, index, total=len(vids))
+
+
+async def _send_next_video(user_id: int, chat_id: int, prev_sent_index: Optional[int]):
+    """
+    When user presses Next; we verify that prev_sent_index matches stored index to prevent skipping ads
+    """
+    u = get_user_state(user_id)
+    stored_index = int(u.get("video_index", 0))
+
+    # If prev_sent_index doesn't match stored index (user tries to fake) -> enforce stored_index
+    if prev_sent_index is None or prev_sent_index != stored_index:
+        # force them to continue from saved index
+        index = stored_index
+    else:
+        index = stored_index + 1
+        set_user_state(user_id, video_index=index)
+
+    vids = _get_videos_for_bin(limit=500)
+    if index >= len(vids):
+        await bot.send_message(chat_id=chat_id, text="No more videos available.")
+        return
+
+    # gating
+    if index >= FREE_LIMIT:
+        await _prompt_watch_ad(user_id, chat_id)
+        return
+
+    vid = vids[index]
+    await _send_video_doc(chat_id, vid, index, total=len(vids))
+
+
+async def _send_video_doc(chat_id: int, vid_doc: Dict[str, Any], index: int, total: int):
+    """
+    Sends a video message (uses file_id stored in DB). Adds inline Next/status controls.
+    """
+    try:
+        file_id = vid_doc.get("file_id")
+        caption = vid_doc.get("caption", "")
+        if not file_id:
+            await bot.send_message(chat_id=chat_id, text="Video record is malformed (no file_id).")
+            return
+
+        # send video by file_id (assumes it is a telegram file_id)
+        await bot.send_video(
+            chat_id=chat_id,
+            video=file_id,
+            caption=caption + f"\n\n🔢 {index+1}/{total}",
+            reply_markup=_make_video_controls(index=index, total=total, show_next=True),
+            parse_mode=ParseMode.HTML,
+        )
+    except TelegramError:
+        log.exception("Failed to send video to chat %s", chat_id)
+        await bot.send_message(chat_id=chat_id, text="Failed to send video (check bot permissions).")
+
+
+# -------------------------
+# Ad gating helpers
+# -------------------------
+async def _prompt_watch_ad(user_id: int, chat_id: int):
+    """
+    Prompt the user to watch ad sessions. This integrates with your ad-session flow.
+    We send an inline keyboard with 'Watch Ad' and 'Buy Premium' options.
+    """
+    kb = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("▶️ Watch Ad", callback_data="watch_ad"),
+                InlineKeyboardButton("💎 Buy Premium", callback_data="buy_premium"),
+            ],
+            [InlineKeyboardButton("🔁 Restart from beginning", callback_data="restart_videos")],
+        ]
+    )
+    await bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "⚠️ You reached the free limit.\n\n"
+            "Watch a short ad to unlock more videos, or buy premium to remove limits."
+        ),
+        reply_markup=kb,
+    )
+
+
+# Callback handlers for ad/watch/purchase should be connected here.
+# Minimal implementations:
+async def _handle_watch_ad_callback(query):
+    user = query.from_user
+    await query.answer()
+    # NOTE: integrate with your shortx/ad-session APIs here.
+    # After user completes ad flow and bot receives confirmation (webhook from shortx or callback),
+    # you MUST call mark_ad_completed(user_id) to increment ads_watched and allow next videos.
+    await bot.send_message(chat_id=query.message.chat.id, text="📺 Opened ad session (placeholder). After ad completes, bot will resume videos.")
+
+
+async def _handle_buy_premium_callback(query):
+    await query.answer()
+    await bot.send_message(chat_id=query.message.chat.id, text="💎 Premium purchase flow (placeholder). Please contact admin.")
+
+
+# Connect watch_ad & buy_premium callbacks in main callback handler above:
+# add inside _handle_callback: if data == "watch_ad": await _handle_watch_ad_callback(query)
+# if data == "buy_premium": await _handle_buy_premium_callback(query)
+# if data == "restart_videos": set_user_state(user.id, video_index=0) and send first video
+
+
+# -------------------------
+# Admin helper: mark ad completed (called from ads.service or external webhook)
+# -------------------------
+def mark_ad_completed(user_id: int, extra_videos: int = 5):
+    """
+    Call this function (synchronously) when ad provider notifies that user watched ad fully.
+    Increments ads_watched and grants extra_videos by increasing FREE_LIMIT for that user (or decrease gating).
+    This function is available for import by your ads.service module.
+    """
+    users_col.update_one({"user_id": user_id}, {"$inc": {"ads_watched": 1, "video_index": -extra_videos}}, upsert=True)
+    # video_index decreased so user can see next videos; alternative designs possible
+
+
+# expose for imports
+__all__ = ["handle_update", "mark_ad_completed", "bot"]
