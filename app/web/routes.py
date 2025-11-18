@@ -1,76 +1,89 @@
 # app/web/routes.py
+from fastapi import FastAPI, Request, Response, HTTPException
+from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
+import logging
 import os
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
-from app.ads.service import get_session, mark_completed
+import time
+from pymongo import MongoClient
+from urllib.parse import urlencode
+
+from app.config import MONGO_URL, MONGO_DB_NAME, DOMAIN
+
+logger = logging.getLogger("app.web.routes")
+logging.basicConfig(level=logging.INFO)
+
+if not MONGO_URL:
+    raise RuntimeError("MONGO_URL required in env for web routes")
+
+client = MongoClient(MONGO_URL)
+db = client[MONGO_DB_NAME]
+ad_sessions_col = db.get_collection("ad_sessions")
 
 app = FastAPI()
 
-@app.get("/", response_class=PlainTextResponse)
-async def root():
-    return "ANGEL ad endpoints live"
+@app.get("/ad/return", response_class=HTMLResponse)
+async def ad_return(token: str = None, uid: str = None):
+    """
+    Called by ad provider / shortlink after user finishes ad.
+    Example: GET /ad/return?token=...&uid=12345
+    - Marks ad_sessions.completed = True if matching token+uid found
+    - Returns a tiny HTML page that redirects back to Telegram (or thanks)
+    """
+    logger.info("ad/return called token=%s uid=%s", token, uid)
+    if not token or not uid:
+        logger.warning("ad/return missing token or uid")
+        raise HTTPException(status_code=400, detail="token and uid required")
 
-@app.get("/ad/landing/{token}", response_class=HTMLResponse)
-async def ad_landing(token: str):
-    """
-    Optional landing page shown to user after they click short link.
-    Should display instructions and a return button that points to /ad/complete/{token}
-    """
-    session = get_session(token)
+    # try to find session
+    session = ad_sessions_col.find_one({"token": token, "user_id": int(uid)})
     if not session:
-        return HTMLResponse("<h3>Invalid ad token</h3>", status_code=404)
-    # Simple page - you can customize
+        # maybe token exists but uid different: try token only
+        session = ad_sessions_col.find_one({"token": token})
+        if not session:
+            logger.warning("ad/return: session not found for token=%s uid=%s", token, uid)
+            # show a generic page but don't expose details
+            html = "<html><body><h3>Thanks</h3><p>We couldn't match your session. Please go back to the bot.</p></body></html>"
+            return HTMLResponse(content=html, status_code=200)
+
+    # mark completed
+    try:
+        ad_sessions_col.update_one({"token": token}, {"$set": {"completed": True, "completed_at": int(time.time())}})
+        logger.info("ad/return: marked completed token=%s user=%s", token, uid)
+    except Exception as e:
+        logger.exception("ad/return: db update failed %s", e)
+
+    # Small HTML that attempts to redirect user back to Telegram deep link or show message
+    # We can redirect to tg:// or simply show a page with instructions.
+    # Prefer to redirect to a neutral page (or domain root) and show message.
+    # Optionally add a meta-refresh to redirect after 2s to DOMAIN or root.
+    domain = DOMAIN.rstrip("/") if DOMAIN else "/"
     html = f"""
-    <html><head><meta name='viewport' content='width=device-width,initial-scale=1'></head><body>
-    <h3>Watch the ad — then click Return</h3>
-    <p>If the provider did not callback us automatically, click the button after you finished the ad.</p>
-    <a href="{session.get('return_url')}" style="display:inline-block;padding:12px;background:#2b90d9;color:#fff;border-radius:6px;text-decoration:none;">Return to bot (complete)</a>
-    </body></html>
+    <html>
+      <head>
+        <meta charset="utf-8"/>
+        <meta http-equiv="refresh" content="3;url={domain}" />
+        <title>Thanks — return</title>
+      </head>
+      <body>
+        <h3>Thanks for watching the ad</h3>
+        <p>You can return to the Telegram bot now. This page will redirect shortly.</p>
+        <p>If it doesn't, <a href="{domain}">click here</a>.</p>
+      </body>
+    </html>
     """
-    return HTMLResponse(html)
+    return HTMLResponse(content=html, status_code=200)
 
-@app.get("/ad/complete/{token}", response_class=PlainTextResponse)
-async def ad_complete(token: str):
-    """
-    Provider or user returning to this URL should mark session completed.
-    Mark completed and return a small message.
-    """
-    s = get_session(token)
-    if not s:
-        raise HTTPException(status_code=404, detail="token not found")
-    mark_completed(token)
-    return PlainTextResponse("Ad session marked completed. You may return to the bot and press I Watched.")
 
-@app.post("/provider/webhook/shortx")
-async def shortx_webhook(request: Request):
-    """
-    Example provider server-to-server webhook.
-    Provider should send data identifying the short link or alias; 
-    this endpoint must validate signature if provider provides one.
-    """
-    body = await request.json()
-    # Provider specific logic here: try to find token in body or alias field
-    # Example: body might contain 'alias': 'adabcdef'
-    alias = body.get("alias") or body.get("shortcode") or body.get("shortened")
-    # attempt to extract token from alias if we used 'ad{token[:8]}' pattern
-    token = None
-    if alias and alias.startswith("ad"):
-        token_candidate = alias[2:]
-        # try to match existing session by short alias prefix
-        from app.ads.service import ad_sessions
-        doc = ad_sessions.find_one({"token": {"$regex": f"^{token_candidate}"}})
-        if doc:
-            token = doc["token"]
-    # fallback: provider might send full url
-    if not token:
-        # try find by full short_url
-        short_url = body.get("shortenedUrl") or body.get("short_url") or body.get("url")
-        if short_url:
-            from app.ads.service import ad_sessions
-            doc = ad_sessions.find_one({"short_url": short_url})
-            if doc:
-                token = doc["token"]
-    if not token:
-        return {"status": "ignored", "reason": "no token matched"}
-    mark_completed(token, provider_payload=body)
+# Admin quick route to mark a session complete (useful for manual testing)
+ADMIN_SECRET = os.getenv("ADMIN_SECRET")  # set a long secret in env
+
+@app.post("/admin/mark_ad_completed")
+async def admin_mark_ad_completed(token: str, secret: str = None):
+    if not ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Admin not configured")
+    if secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid secret")
+    res = ad_sessions_col.find_one_and_update({"token": token}, {"$set": {"completed": True, "completed_at": int(time.time())}})
+    if not res:
+        raise HTTPException(status_code=404, detail="Token not found")
     return {"status": "ok", "token": token}
