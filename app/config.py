@@ -1,39 +1,29 @@
 # app/config.py
 import os
 
-# Bot
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN required in env")
+# Core bot
+BOT_TOKEN = os.getenv("BOT_TOKEN")  # required
 
-# Mongo (you insisted on MONGO_URL name)
-MONGO_URL = os.getenv("MONGO_URL")
-if not MONGO_URL:
-    raise RuntimeError("MONGO_URL required in env")
-
-# DB name
+# Note: user requested MONGO_URL naming — keep it exactly
+MONGO_URL = os.getenv("MONGO_URL")  # required
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "video_bot_db")
 
-# Free videos per user
+# Limits & behaviour
 FREE_LIMIT = int(os.getenv("FREE_LIMIT", "5"))
-
-# Required join group link (fallback)
+REQUIRED_GROUP_ID = os.getenv("REQUIRED_GROUP_ID")  # optional
 REQUIRED_GROUP_LINK = os.getenv("REQUIRED_GROUP_LINK", "https://t.me/your_group")
 
-# Domain for ad return callbacks (must include protocol, e.g. https://angle-jldx.onrender.com)
-DOMAIN = os.getenv("DOMAIN")
-if not DOMAIN:
-    # Not fatal — but recommended to set for ad callbacks / shortlinks
-    DOMAIN = os.getenv("PUBLIC_URL", "https://angle-jldx.onrender.com")
+# Shortlink (shortxlinks.com) integration
+# Put your shortxlinks API key in SHORTLINK_API_KEY environment variable
+SHORTLINK_API_KEY = os.getenv("SHORTLINK_API_KEY")  # optional, but set it
+SHORTLINK_API_URL = os.getenv("SHORTLINK_API_URL", "https://shortxlinks.com/api")  # default
 
-# Shortlink provider API key (shortxlinks.com API token)
-SHORTLINK_API_KEY = os.getenv("SHORTLINK_API_KEY")  # optional
+# Where ad redirects should return to (your service)
+# e.g. https://angle-jldx.onrender.com
+DOMAIN = os.getenv("DOMAIN", "https://angle-jldx.onrender.com")
 
-# Shortlink API base (allow override)
-SHORTLINK_API_BASE = os.getenv("SHORTLINK_API_BASE", "https://shortxlinks.com/api")
-
-# Admin user ids (comma separated)
-ADMIN_USERS = [int(x) for x in os.getenv("ADMIN_USERS", "").split(",") if x.strip()]  # e.g. "12345678,87654321"
-
-# Other optional settings
+# Ad provider fallback URL (used if shortener missing)
 AD_PROVIDER_URL = os.getenv("AD_PROVIDER_URL", REQUIRED_GROUP_LINK)
+
+# Logging level
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
