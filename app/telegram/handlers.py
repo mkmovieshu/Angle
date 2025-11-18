@@ -41,8 +41,9 @@ TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}/"
 
 def tg_request(method: str, payload: Dict[str, Any], timeout: float = 10.0):
     """
-    Wrapper for Telegram API calls with detailed logging on error.
-    Logs response status and body so we can debug 400 responses.
+    Wrapper for Telegram API calls.
+    IMPORTANT: do NOT call r.raise_for_status() here so we can log Telegram JSON error bodies (400).
+    Returns parsed JSON on success, or the error JSON (if parseable), or None on network failure.
     """
     url = urljoin(TELEGRAM_API, method)
     try:
@@ -52,24 +53,24 @@ def tg_request(method: str, payload: Dict[str, Any], timeout: float = 10.0):
         logger.exception("tg_request network error %s %s", url, exc)
         return None
 
-    # always log status and text for debugging
-    logger.info("tg_request response: %s %s", r.status_code, r.text[:1000])
+    # Always log full status + body (first 2000 chars)
+    text = r.text or ""
+    logger.info("tg_request response status=%s body=%s", r.status_code, text[:2000])
 
-    if r.status_code >= 400:
-        # try to parse telegram JSON error if present
-        try:
-            err = r.json()
-            logger.error("Telegram error JSON: %s", err)
-        except Exception:
-            logger.error("Telegram error (non-json): %s", r.text)
-        # return None to caller (caller can handle)
+    # Try to parse JSON (Telegram returns JSON error info for 4xx/5xx)
+    try:
+        j = r.json()
+    except Exception:
+        # Not JSON — still return None but log
+        logger.error("tg_request: response is not JSON (status %s). body=%s", r.status_code, text[:2000])
         return None
 
-    try:
-        return r.json()
-    except Exception:
-        # sometimes Telegram returns empty body; still return raw text
-        return {"ok": True, "raw": r.text}
+    # If Telegram reported ok==False, log and return the JSON so caller can inspect
+    if not j.get("ok", False):
+        logger.error("Telegram API returned error: %s", j)
+        return j
+
+    return j
 
 def safe_int_chat_id(chat_id):
     try:
