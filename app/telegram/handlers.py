@@ -4,11 +4,12 @@ import logging
 import uuid
 import time
 from typing import Dict, Any, Optional
-from urllib.parse import urlencode
 
 import httpx
 from pymongo import MongoClient
+from urllib.parse import urljoin, quote_plus
 
+# local config
 from app.config import (
     BOT_TOKEN,
     MONGO_URL,
@@ -17,22 +18,20 @@ from app.config import (
     REQUIRED_GROUP_LINK,
     AD_PROVIDER_URL,
     DOMAIN,
-    SHORTLINK_API_URL,
-    SHORTLINK_API_KEY,
-    SHORTLINK_PREFER_SHORT,
     LOG_LEVEL,
 )
 
 logger = logging.getLogger(__name__)
+logger.setLevel(getattr(logging, LOG_LEVEL.upper(), logging.INFO))
 logging.basicConfig(level=getattr(logging, LOG_LEVEL.upper(), logging.INFO))
 
-# Basic env checks
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN required in env")
+
 if not MONGO_URL:
     raise RuntimeError("MONGO_URL required in env")
 
-# Mongo
+# Mongo client
 client = MongoClient(MONGO_URL)
 db = client[MONGO_DB_NAME]
 
@@ -43,7 +42,7 @@ ad_sessions_col = db.get_collection("ad_sessions")
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}/"
 
 def tg_request(method: str, payload: Dict[str, Any], timeout: float = 10.0):
-    url = TELEGRAM_API + method
+    url = urljoin(TELEGRAM_API, method)
     try:
         logger.debug("TG REQ -> %s payload keys=%s", url, list(payload.keys()))
         r = httpx.post(url, json=payload, timeout=timeout)
@@ -52,16 +51,18 @@ def tg_request(method: str, payload: Dict[str, Any], timeout: float = 10.0):
         return None
 
     text = r.text or ""
-    logger.info("tg_request response status=%s body=%s", r.status_code, text[:2000])
+    logger.info("tg_request response status=%s body=%s", r.status_code, (text or "")[:2000])
+
     try:
         j = r.json()
     except Exception:
-        logger.error("tg_request: response not JSON (status %s). body=%s", r.status_code, text[:2000])
+        logger.error("tg_request: response not JSON, status=%s body=%s", r.status_code, text[:2000])
         return None
 
     if not j.get("ok", False):
         logger.error("Telegram API returned error: %s", j)
         return j
+
     return j
 
 def safe_int_chat_id(chat_id):
@@ -129,8 +130,9 @@ def ensure_user_doc(user_id: int):
 def get_next_video_for_user(user_id: int):
     u = ensure_user_doc(user_id)
     cursor = u.get("cursor", 0)
-    doc = videos_col.find().sort("_id", -1).skip(cursor).limit(1)
-    docs = list(doc)
+    # newest first
+    doc_cursor = videos_col.find().sort("_id", -1).skip(cursor).limit(1)
+    docs = list(doc_cursor)
     if not docs:
         return None
     return docs[0]
@@ -150,40 +152,6 @@ def create_ad_session(user_id: int):
     }
     ad_sessions_col.insert_one(doc)
     return doc
-
-# ----------------- Shortlink helper -----------------
-def create_shortlink(long_url: str) -> Optional[str]:
-    """
-    Create a shortlink via SHORTLINK_API_URL using SHORTLINK_API_KEY.
-    Returns shortened URL on success, or None on failure.
-    """
-    try:
-        # Build params properly (URL-encode long_url)
-        params = {"api": SHORTLINK_API_KEY, "url": long_url}
-        # Many providers accept GET with query params.
-        r = httpx.get(SHORTLINK_API_URL, params=params, timeout=8.0)
-        logger.info("shortlink request: %s (status %s)", r.url, r.status_code)
-        # If not OK, log and return None
-        if r.status_code != 200:
-            logger.error("shortlink creation failed: status=%s body=%s", r.status_code, r.text[:1000])
-            return None
-        # Parse JSON (shortxlinks returns JSON with keys "status" and "shortenedUrl")
-        j = r.json()
-        if isinstance(j, dict) and j.get("status") == "success":
-            short = j.get("shortenedUrl")
-            # return plain scheme if missing
-            return short
-        # Some providers return plain text (the url)
-        if isinstance(j, str) and j.startswith("http"):
-            return j
-        # Try to handle text response (not JSON)
-        txt = (r.text or "").strip()
-        if txt.startswith("http"):
-            return txt
-        logger.error("shortlink: unexpected response %s", j)
-    except Exception as e:
-        logger.exception("shortlink creation exception: %s", e)
-    return None
 
 # exported function used by routes.py
 async def handle_update(data: Dict[str, Any]):
@@ -214,6 +182,26 @@ async def _handle_message(msg: Dict[str, Any]):
         await _send_video_flow(chat_id, user_id)
         return
 
+    # Admin utility: list some videos (private chat only, owner should secure)
+    if text and text.startswith("/db_videos_list"):
+        # Only allow in private chat by owner (quick guard)
+        if chat.get("type") != "private":
+            send_message(chat_id, "Use this command in private.")
+            return
+        # show count + first 8 docs summary
+        total = videos_col.count_documents({})
+        docs = list(videos_col.find().sort("_id", -1).limit(8))
+        out_lines = [f"Videos in DB: {total}"]
+        for d in docs:
+            # avoid backslash in fstring expression; build safely
+            vid = d.get("_id")
+            file_present = "yes" if d.get("file_id") else "no"
+            caption = (d.get("caption", "") or "").replace("\n", " ")
+            caption_snip = caption[:60]
+            out_lines.append(f"- id:{str(vid)[:8]} file_id:{file_present} caption:{caption_snip}")
+        send_message(chat_id, "\n".join(out_lines))
+        return
+
     send_message(chat_id, "I didn't understand. Use the menu.", reply_markup=build_main_menu())
 
 async def _handle_callback(cb: Dict[str, Any]):
@@ -242,17 +230,17 @@ async def _handle_callback(cb: Dict[str, Any]):
         await _send_video_flow(chat_id, user_id)
         return
     if cmd == "watch_ad":
-        # create session and build ad/open URL (shorten it)
+        # Direct-mode: build direct return URL on our DOMAIN (no shortener)
         session = create_ad_session(user_id)
-        # long return URL on our domain
-        long_return = f"{DOMAIN.rstrip('/')}/ad/return?token={session['token']}&uid={user_id}"
-        short = None
-        if SHORTLINK_PREFER_SHORT:
-            short = create_shortlink(long_return)
-            if not short:
-                logger.warning("Shortener failed, falling back to long return URL")
-        final_url = short or long_return
-        keyboard = {"inline_keyboard": [[{"text": "Watch ad (open)", "url": final_url}], [{"text": "I watched", "callback_data": f"iwatched:{session['token']}"}]]}
+        token = session["token"]
+        # Build direct return URL — this is the link user opens to "watch ad" (you should serve ad page at this endpoint)
+        long_return = f"{DOMAIN}/ad/return?token={quote_plus(token)}&uid={quote_plus(str(user_id))}"
+        keyboard = {
+            "inline_keyboard": [
+                [{"text": "Watch ad (open)", "url": long_return}],
+                [{"text": "I watched", "callback_data": f"iwatched:{token}"}]
+            ]
+        }
         send_message(chat_id, "Open the ad then press 'I watched' only after real completion.", reply_markup=keyboard)
         return
     if cmd == "iwatched":
@@ -278,15 +266,11 @@ async def _send_video_flow(chat_id: int, user_id: int):
 
     if free_remaining <= 0:
         session = create_ad_session(user_id)
-        long_return = f"{DOMAIN.rstrip('/')}/ad/return?token={session['token']}&uid={user_id}"
-        short = None
-        if SHORTLINK_PREFER_SHORT:
-            short = create_shortlink(long_return)
-            if not short:
-                logger.warning("Shortener failed, falling back to long return URL")
-        final_url = short or long_return
+        token = session["token"]
+        # Direct link (no shortener) to our domain
+        long_return = f"{DOMAIN}/ad/return?token={quote_plus(token)}&uid={quote_plus(str(user_id))}"
         kb = {"inline_keyboard": [
-            [{"text": "Watch Ad to get more videos", "url": final_url}],
+            [{"text": "Watch Ad to get more videos", "url": long_return}],
             [{"text": "Join Group", "url": REQUIRED_GROUP_LINK}]
         ]}
         send_message(chat_id, "You used your free videos. Watch an ad to get more.", reply_markup=kb)
