@@ -4,10 +4,10 @@ import logging
 import uuid
 import time
 from typing import Dict, Any, Optional
+from urllib.parse import urlencode
 
 import httpx
 from pymongo import MongoClient
-from urllib.parse import urljoin, urlencode
 
 from app.config import (
     BOT_TOKEN,
@@ -16,40 +16,34 @@ from app.config import (
     FREE_LIMIT,
     REQUIRED_GROUP_LINK,
     AD_PROVIDER_URL,
+    DOMAIN,
     SHORTLINK_API_URL,
     SHORTLINK_API_KEY,
-    SHORTLINK_PREFER_NO_SHORTENING,
-    DOMAIN,
-    get_logger,
+    SHORTLINK_PREFER_SHORT,
+    LOG_LEVEL,
 )
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=getattr(logging, LOG_LEVEL.upper(), logging.INFO))
 
-# Validate critical config (BOT_TOKEN and MONGO_URL already validated by config module)
-TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}/"
+# Basic env checks
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN required in env")
+if not MONGO_URL:
+    raise RuntimeError("MONGO_URL required in env")
 
-# Mongo client
+# Mongo
 client = MongoClient(MONGO_URL)
 db = client[MONGO_DB_NAME]
 
-# Preserve exact collection names
 videos_col = db.get_collection("videos")
 users_col = db.get_collection("users")
 ad_sessions_col = db.get_collection("ad_sessions")
 
-# ---- Telegram helpers ----
-def safe_int_chat_id(chat_id):
-    try:
-        return int(chat_id)
-    except Exception:
-        return None
+TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}/"
 
 def tg_request(method: str, payload: Dict[str, Any], timeout: float = 10.0):
-    """
-    Wrapper for Telegram API calls (sync, uses httpx).
-    Returns parsed JSON on success or the error JSON if Telegram returned ok==False.
-    """
-    url = urljoin(TELEGRAM_API, method)
+    url = TELEGRAM_API + method
     try:
         logger.debug("TG REQ -> %s payload keys=%s", url, list(payload.keys()))
         r = httpx.post(url, json=payload, timeout=timeout)
@@ -58,18 +52,23 @@ def tg_request(method: str, payload: Dict[str, Any], timeout: float = 10.0):
         return None
 
     text = r.text or ""
-    logger.info("tg_request response status=%s body=%s", r.status_code, (text[:2000] + ("..." if len(text) > 2000 else "")))
-
+    logger.info("tg_request response status=%s body=%s", r.status_code, text[:2000])
     try:
         j = r.json()
     except Exception:
-        logger.error("tg_request: response not JSON status=%s body=%s", r.status_code, text[:1000])
+        logger.error("tg_request: response not JSON (status %s). body=%s", r.status_code, text[:2000])
         return None
 
     if not j.get("ok", False):
         logger.error("Telegram API returned error: %s", j)
         return j
     return j
+
+def safe_int_chat_id(chat_id):
+    try:
+        return int(chat_id)
+    except Exception:
+        return None
 
 def send_message(chat_id: int, text: str, reply_markup: Optional[Dict]=None, parse_mode="HTML"):
     if not text or not text.strip():
@@ -106,7 +105,6 @@ def answer_callback(callback_id: str, text: Optional[str]=None, show_alert: bool
         payload["text"] = text
     return tg_request("answerCallbackQuery", payload)
 
-# ---- UI / menus ----
 def build_main_menu():
     keyboard = {
         "inline_keyboard": [
@@ -116,7 +114,6 @@ def build_main_menu():
     }
     return keyboard
 
-# ---- DB helpers ----
 def ensure_user_doc(user_id: int):
     u = users_col.find_one({"user_id": user_id})
     if not u:
@@ -132,8 +129,8 @@ def ensure_user_doc(user_id: int):
 def get_next_video_for_user(user_id: int):
     u = ensure_user_doc(user_id)
     cursor = u.get("cursor", 0)
-    doc_cursor = videos_col.find().sort("_id", -1).skip(cursor).limit(1)
-    docs = list(doc_cursor)
+    doc = videos_col.find().sort("_id", -1).skip(cursor).limit(1)
+    docs = list(doc)
     if not docs:
         return None
     return docs[0]
@@ -154,88 +151,42 @@ def create_ad_session(user_id: int):
     ad_sessions_col.insert_one(doc)
     return doc
 
-# ---- Shortlink integration ----
-def _make_shortlink_with_provider(long_url: str) -> Optional[str]:
+# ----------------- Shortlink helper -----------------
+def create_shortlink(long_url: str) -> Optional[str]:
     """
-    Try to create a shortlink via configured SHORTLINK_API_URL and SHORTLINK_API_KEY.
-    Provider expected API: POST or GET depending on provider. We'll try POST with common JSON/FORM
-    and fallback to GET query.
-    Returns shortened URL string or None on failure.
+    Create a shortlink via SHORTLINK_API_URL using SHORTLINK_API_KEY.
+    Returns shortened URL on success, or None on failure.
     """
-    # If user prefers no shortening, return original
-    if SHORTLINK_PREFER_NO_SHORTENING:
-        logger.info("SHORTLINK_PREFER_NO_SHORTENING set, returning long_url as-is")
-        return long_url
-
-    if not SHORTLINK_API_URL:
-        logger.warning("SHORTLINK_API_URL not configured; skipping shortening")
-        return None
-
-    headers = {"User-Agent": "AngleShortener/1.0"}
     try:
-        # Try POST JSON first
-        payload = {"api": SHORTLINK_API_KEY, "url": long_url}
-        logger.debug("Attempting shortlink POST to %s payload=%s", SHORTLINK_API_URL, payload)
-        r = httpx.post(SHORTLINK_API_URL, json=payload, headers=headers, timeout=8.0)
-        if r.status_code == 200:
-            try:
-                j = r.json()
-                # flexible parsing: provider may return {'status':'success','shortenedUrl':...} or {'short':...}
-                short_url = None
-                if isinstance(j, dict):
-                    short_url = j.get("shortenedUrl") or j.get("short") or j.get("short_link") or j.get("url")
-                if short_url:
-                    logger.info("Shortlink created (POST): %s", short_url)
-                    return short_url
-            except Exception:
-                logger.exception("shortlink provider returned non-json or parse failed (POST). status=%s body=%s", r.status_code, r.text[:500])
-
-        # If POST didn't work, try GET with query params
-        logger.debug("Attempting shortlink GET fallback to %s", SHORTLINK_API_URL)
+        # Build params properly (URL-encode long_url)
         params = {"api": SHORTLINK_API_KEY, "url": long_url}
-        r2 = httpx.get(SHORTLINK_API_URL, params=params, headers=headers, timeout=8.0)
-        if r2.status_code == 200:
-            try:
-                j2 = r2.json()
-                if isinstance(j2, dict):
-                    short_url = j2.get("shortenedUrl") or j2.get("short") or j2.get("short_link") or j2.get("url")
-                    if short_url:
-                        logger.info("Shortlink created (GET): %s", short_url)
-                        return short_url
-            except Exception:
-                logger.exception("shortlink provider returned non-json or parse failed (GET). status=%s body=%s", r2.status_code, r2.text[:500])
-        logger.warning("Shortlink creation failed: status codes %s / %s", r.status_code if 'r' in locals() else None, r2.status_code if 'r2' in locals() else None)
-    except Exception as exc:
-        logger.exception("shortlink creation exception: %s", exc)
+        # Many providers accept GET with query params.
+        r = httpx.get(SHORTLINK_API_URL, params=params, timeout=8.0)
+        logger.info("shortlink request: %s (status %s)", r.url, r.status_code)
+        # If not OK, log and return None
+        if r.status_code != 200:
+            logger.error("shortlink creation failed: status=%s body=%s", r.status_code, r.text[:1000])
+            return None
+        # Parse JSON (shortxlinks returns JSON with keys "status" and "shortenedUrl")
+        j = r.json()
+        if isinstance(j, dict) and j.get("status") == "success":
+            short = j.get("shortenedUrl")
+            # return plain scheme if missing
+            return short
+        # Some providers return plain text (the url)
+        if isinstance(j, str) and j.startswith("http"):
+            return j
+        # Try to handle text response (not JSON)
+        txt = (r.text or "").strip()
+        if txt.startswith("http"):
+            return txt
+        logger.error("shortlink: unexpected response %s", j)
+    except Exception as e:
+        logger.exception("shortlink creation exception: %s", e)
     return None
 
-def create_ad_open_url(token: str, uid: int) -> str:
-    """
-    Build the URL the user will open to watch the ad.
-    By default we construct a return URL on our domain that ad networks/shortener should redirect back to:
-      {SHORTLINK_API_URL or DOMAIN}/ad/return?token={token}&uid={uid}
-    Then we try to shorten it (if provider configured).
-    """
-    # canonical return URL (on our domain)
-    return_url = f"{DOMAIN.rstrip('/')}/ad/return?token={token}&uid={uid}"
-    # Try provider based shortlink
-    shortened = _make_shortlink_with_provider(return_url)
-    if shortened:
-        return shortened
-    # fallback: if provider not available, return a plain (non-shortened) URL or AD_PROVIDER_URL
-    # If AD_PROVIDER_URL set to external ad network, prefer it (but must include token/uid)
-    if AD_PROVIDER_URL and "{token}" in AD_PROVIDER_URL:
-        return AD_PROVIDER_URL.format(token=token, uid=uid)
-    if AD_PROVIDER_URL and "?" in AD_PROVIDER_URL:
-        # append token/uid as query if placeholders not used
-        sep = "&" if "?" in AD_PROVIDER_URL else "?"
-        return f"{AD_PROVIDER_URL}{sep}token={token}&uid={uid}"
-    # last resort: return the local return_url
-    return return_url
-
-# ---- exported function used by routes.py ----
+# exported function used by routes.py
 async def handle_update(data: Dict[str, Any]):
-    # wrapper to accept webhook update shape (telegram JSON)
     if "message" in data:
         await _handle_message(data["message"])
     elif "callback_query" in data:
@@ -245,7 +196,6 @@ async def handle_update(data: Dict[str, Any]):
     else:
         logger.info("Unhandled update type: %s", type(data))
 
-# ---- message handlers ----
 async def _handle_message(msg: Dict[str, Any]):
     chat = msg.get("chat") or {}
     chat_id = chat.get("id")
@@ -292,13 +242,17 @@ async def _handle_callback(cb: Dict[str, Any]):
         await _send_video_flow(chat_id, user_id)
         return
     if cmd == "watch_ad":
+        # create session and build ad/open URL (shorten it)
         session = create_ad_session(user_id)
-        # create open-url (shortened if possible)
-        open_url = create_ad_open_url(session["token"], user_id)
-        keyboard = {"inline_keyboard": [
-            [{"text": "Watch ad (open)", "url": open_url}],
-            [{"text": "I watched", "callback_data": f"iwatched:{session['token']}"}]
-        ]}
+        # long return URL on our domain
+        long_return = f"{DOMAIN.rstrip('/')}/ad/return?token={session['token']}&uid={user_id}"
+        short = None
+        if SHORTLINK_PREFER_SHORT:
+            short = create_shortlink(long_return)
+            if not short:
+                logger.warning("Shortener failed, falling back to long return URL")
+        final_url = short or long_return
+        keyboard = {"inline_keyboard": [[{"text": "Watch ad (open)", "url": final_url}], [{"text": "I watched", "callback_data": f"iwatched:{session['token']}"}]]}
         send_message(chat_id, "Open the ad then press 'I watched' only after real completion.", reply_markup=keyboard)
         return
     if cmd == "iwatched":
@@ -324,8 +278,15 @@ async def _send_video_flow(chat_id: int, user_id: int):
 
     if free_remaining <= 0:
         session = create_ad_session(user_id)
+        long_return = f"{DOMAIN.rstrip('/')}/ad/return?token={session['token']}&uid={user_id}"
+        short = None
+        if SHORTLINK_PREFER_SHORT:
+            short = create_shortlink(long_return)
+            if not short:
+                logger.warning("Shortener failed, falling back to long return URL")
+        final_url = short or long_return
         kb = {"inline_keyboard": [
-            [{"text": "Watch Ad to get more videos", "callback_data": f"watch_ad:{session['token']}"}],
+            [{"text": "Watch Ad to get more videos", "url": final_url}],
             [{"text": "Join Group", "url": REQUIRED_GROUP_LINK}]
         ]}
         send_message(chat_id, "You used your free videos. Watch an ad to get more.", reply_markup=kb)
@@ -337,10 +298,7 @@ async def _send_video_flow(chat_id: int, user_id: int):
         return
 
     file_id = doc.get("file_id")
-    caption = doc.get("caption", "") or ""
-    # safe caption shorten & strip newlines (avoid f-string backslash)
-    safe_caption = (caption[:300].replace("\n", " "))
-
+    caption = doc.get("caption", "")
     kb = {"inline_keyboard": [
         [{"text": "⏭ Next", "callback_data": "next:0"}],
         [{"text": "📢 Watch Ad (to refill)", "callback_data": f"watch_ad:auto"}],
@@ -348,8 +306,8 @@ async def _send_video_flow(chat_id: int, user_id: int):
     ]}
 
     if file_id:
-        send_video(chat_id, file_id, caption=safe_caption, reply_markup=kb)
+        send_video(chat_id, file_id, caption=caption, reply_markup=kb)
     else:
-        send_message(chat_id, f"{safe_caption}\n\n(File not stored on bot.)", reply_markup=kb)
+        send_message(chat_id, f"{caption}\n\n(File not stored on bot.)", reply_markup=kb)
 
     users_col.update_one({"user_id": user_id}, {"$inc": {"free_remaining": -1, "cursor": 1}})
