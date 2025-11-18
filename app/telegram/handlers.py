@@ -3,35 +3,37 @@ import os
 import logging
 import uuid
 import time
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 import httpx
 from pymongo import MongoClient
 from urllib.parse import urljoin
 
-logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+from app.config import (
+    BOT_TOKEN,
+    MONGO_URL,
+    MONGO_DB_NAME,
+    FREE_LIMIT,
+    REQUIRED_GROUP_LINK,
+    AD_PROVIDER_URL,
+    SHORTLINK_API_KEY,
+    SHORTLINK_API_URL,
+    DOMAIN,
+    LOG_LEVEL,
+)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=getattr(logging, LOG_LEVEL.upper(), logging.INFO))
+
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN required in env")
 
-# NOTE: you asked for MONGO_URL naming
-MONGO_URL = os.getenv("MONGO_URL")
 if not MONGO_URL:
     raise RuntimeError("MONGO_URL required in env")
 
-DB_NAME = os.getenv("MONGO_DB_NAME", "video_bot_db")
-FREE_LIMIT = int(os.getenv("FREE_LIMIT", "5"))
-
-REQUIRED_GROUP_ID = os.getenv("REQUIRED_GROUP_ID")  # optional
-REQUIRED_GROUP_LINK = os.getenv("REQUIRED_GROUP_LINK", "https://t.me/your_group")
-
-AD_PROVIDER_URL = os.getenv("AD_PROVIDER_URL", REQUIRED_GROUP_LINK)
-
 # Mongo
 client = MongoClient(MONGO_URL)
-db = client[DB_NAME]
+db = client[MONGO_DB_NAME]
 
 videos_col = db.get_collection("videos")
 users_col = db.get_collection("users")
@@ -42,30 +44,25 @@ TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}/"
 def tg_request(method: str, payload: Dict[str, Any], timeout: float = 10.0):
     """
     Wrapper for Telegram API calls.
-    IMPORTANT: do NOT call r.raise_for_status() here so we can log Telegram JSON error bodies (400).
     Returns parsed JSON on success, or the error JSON (if parseable), or None on network failure.
     """
     url = urljoin(TELEGRAM_API, method)
     try:
-        logger.debug("TG REQUEST %s %s", url, payload)
+        logger.debug("TG REQUEST %s %s", url, payload.keys())
         r = httpx.post(url, json=payload, timeout=timeout)
     except Exception as exc:
         logger.exception("tg_request network error %s %s", url, exc)
         return None
 
-    # Always log full status + body (first 2000 chars)
     text = r.text or ""
     logger.info("tg_request response status=%s body=%s", r.status_code, text[:2000])
 
-    # Try to parse JSON (Telegram returns JSON error info for 4xx/5xx)
     try:
         j = r.json()
     except Exception:
-        # Not JSON — still return None but log
         logger.error("tg_request: response is not JSON (status %s). body=%s", r.status_code, text[:2000])
         return None
 
-    # If Telegram reported ok==False, log and return the JSON so caller can inspect
     if not j.get("ok", False):
         logger.error("Telegram API returned error: %s", j)
         return j
@@ -137,8 +134,8 @@ def ensure_user_doc(user_id: int):
 def get_next_video_for_user(user_id: int):
     u = ensure_user_doc(user_id)
     cursor = u.get("cursor", 0)
-    doc = videos_col.find().sort("_id", -1).skip(cursor).limit(1)
-    docs = list(doc)
+    doc_cursor = videos_col.find().sort("_id", -1).skip(cursor).limit(1)
+    docs = list(doc_cursor)
     if not docs:
         return None
     return docs[0]
@@ -146,9 +143,51 @@ def get_next_video_for_user(user_id: int):
 def increment_cursor(user_id: int):
     users_col.update_one({"user_id": user_id}, {"$inc": {"cursor": 1}})
 
-def create_ad_session(user_id: int):
+async def create_shortlink(target_url: str) -> str:
+    """
+    Create a shortlink using SHORTLINK_API_KEY + SHORTLINK_API_URL.
+    If shortener not configured or fails, return original target_url.
+    """
+    if not SHORTLINK_API_KEY or not SHORTLINK_API_URL:
+        logger.info("SHORTLINK not configured, returning original url")
+        return target_url
+
+    payload = {"api": SHORTLINK_API_KEY, "url": target_url}
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.post(SHORTLINK_API_URL, data=payload, timeout=10)
+        text = r.text or ""
+        logger.debug("shortlink response status=%s body=%s", r.status_code, text[:1000])
+        j = r.json()
+        # Expecting something like {"status":"success","shortenedUrl":"..."} but be flexible
+        if isinstance(j, dict):
+            # common shapes
+            if j.get("status") in ("success", "ok") and j.get("shortenedUrl"):
+                return j["shortenedUrl"]
+            # some apis might return 'short' or 'result'
+            if j.get("short"):
+                return j["short"]
+            if j.get("result") and isinstance(j["result"], str):
+                return j["result"]
+        # fallback: if API returned plain text URL
+        if r.status_code == 200 and text.startswith("http"):
+            return text.strip()
+    except Exception as exc:
+        logger.exception("shortlink creation failed: %s", exc)
+
+    return target_url
+
+async def create_ad_session(user_id: int):
+    """
+    Creates an ad session and returns session doc.
+    Builds a return URL to our service, shortens it if configured.
+    """
     token = str(uuid.uuid4())
-    provider_url = AD_PROVIDER_URL
+    # return URL that advertiser/shortener will redirect back to
+    raw_return = f"{DOMAIN.rstrip('/')}/ad/return?token={token}&uid={user_id}"
+    short_url = await create_shortlink(raw_return) if SHORTLINK_API_KEY else raw_return
+    provider_url = short_url or AD_PROVIDER_URL or REQUIRED_GROUP_LINK
+
     doc = {
         "token": token,
         "user_id": user_id,
@@ -188,32 +227,21 @@ async def _handle_message(msg: Dict[str, Any]):
         await _send_video_flow(chat_id, user_id)
         return
 
-    # admin quick commands (simple)
-    if text and text.startswith("/debug_db"):
-        # show counts
-        videos_count = videos_col.count_documents({})
-        users_count = users_col.count_documents({})
-        ad_count = ad_sessions_col.count_documents({})
-        send_message(chat_id, f"DB status:\nvideos={videos_count}\nusers={users_count}\nad_sessions={ad_count}")
-        return
-
+    # admin helper: /list_videos to display a short list (only DM to owner typically)
     if text and text.startswith("/list_videos"):
-        # list first 20 video summary lines
-        docs = videos_col.find().sort("_id", -1).limit(20)
-        out_lines = []
+        docs = list(videos_col.find().sort("_id", -1).limit(50))
+        if not docs:
+            send_message(chat_id, "No videos in DB.")
+            return
+        out_lines: List[str] = []
         for d in docs:
-            # build caption preview safely (avoid backslashes in f-string expressions)
-            caption_raw = d.get("caption", "")
-            caption_preview = caption_raw.replace("\n", " ")[:60]
-            id_short = str(d.get("_id"))[:8]
-            file_yes = "yes" if d.get("file_id") else "no"
-            out_lines.append(f"- id:{id_short} file_id:{file_yes} caption:{caption_preview}")
-        if not out_lines:
-            send_message(chat_id, "No videos found in DB.")
-        else:
-            # send in chunks of ~20 lines to avoid message length limits
-            chunk = "\n".join(out_lines)
-            send_message(chat_id, f"Videos:\n{chunk}")
+            vidid = str(d.get("_id"))[:8]
+            has_file = "yes" if d.get("file_id") else "no"
+            caption_snip = (d.get("caption", "")[:60]).replace("\n", " ")
+            out_lines.append(f"- id:{vidid} file_id:{has_file} caption:{caption_snip}")
+        chunks = ["\n".join(out_lines[i:i+10]) for i in range(0, len(out_lines), 10)]
+        for c in chunks:
+            send_message(chat_id, f"<code>{c}</code>")
         return
 
     send_message(chat_id, "I didn't understand. Use the menu.", reply_markup=build_main_menu())
@@ -244,13 +272,8 @@ async def _handle_callback(cb: Dict[str, Any]):
         await _send_video_flow(chat_id, user_id)
         return
     if cmd == "watch_ad":
-        session = create_ad_session(user_id)
-        # create deep return url that shortener/ad provider should redirect to after watching
-        return_url = f"{os.getenv('DOMAIN','')}/ad/return?token={session['token']}&uid={user_id}"
-        # If AD_PROVIDER_URL is configured as a shortener endpoint we might want to build a short link here,
-        # but by default use AD_PROVIDER_URL or return_url.
-        provider_url = AD_PROVIDER_URL or return_url
-        keyboard = {"inline_keyboard": [[{"text": "Watch ad (open)", "url": provider_url}], [{"text": "I watched", "callback_data": f"iwatched:{session['token']}"}]]}
+        session = await create_ad_session(user_id)
+        keyboard = {"inline_keyboard": [[{"text": "Watch ad (open)", "url": session["provider_url"]}], [{"text": "I watched", "callback_data": f"iwatched:{session['token']}"}]]}
         send_message(chat_id, "Open the ad then press 'I watched' only after real completion.", reply_markup=keyboard)
         return
     if cmd == "iwatched":
@@ -275,7 +298,7 @@ async def _send_video_flow(chat_id: int, user_id: int):
     cursor = u.get("cursor", 0)
 
     if free_remaining <= 0:
-        session = create_ad_session(user_id)
+        session = await create_ad_session(user_id)
         kb = {"inline_keyboard": [
             [{"text": "Watch Ad to get more videos", "callback_data": f"watch_ad:{session['token']}"}],
             [{"text": "Join Group", "url": REQUIRED_GROUP_LINK}]
