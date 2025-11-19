@@ -1,25 +1,12 @@
-FROM python:3.10-slim
-
-WORKDIR /app
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    gcc \
-    python3-dev \
-    libffi-dev \
-    libssl-dev \
-    libjpeg-dev \
-    zlib1g-dev \
-    git \
-    && rm -rf /var/lib/apt/lists/*
-
-COPY requirements.txt .
-
-RUN pip install --upgrade pip setuptools wheel
-RUN pip install --no-cache-dir -r requirements.txt
-
-COPY . .
-
-EXPOSE 8080
-
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
+fastapi==0.95.1
+uvicorn[standard]==0.22.0
+motor==3.1.1
+python-telegram-bot==20.6
+pymongo==4.4.0
+aiohttp==3.8.4
+pydantic==1.10.11
+pyrogram==2.0.25
+pyTelegramBotAPI==4.12.0
+requests==2.31.0
+python-dotenv==1.0.0
+httpx==0.24.1
