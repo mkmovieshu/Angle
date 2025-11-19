@@ -2,11 +2,10 @@
 import logging
 from typing import Optional, Dict, Any, List
 from telegram.error import TelegramError
-from app.telegram.bot import bot
-from app.database import users, videos
 from app.telegram.keyboards import video_control_buttons
+from app.database import users, videos  # these should be motor async collections
 
-log = logging.getLogger("video_service")
+log = logging.getLogger(__name__)
 
 async def ensure_user_doc(user_id: int, username: Optional[str] = None) -> Dict[str, Any]:
     u = await users.find_one({"user_id": user_id})
@@ -25,9 +24,11 @@ async def get_unseen_video_for_user(user_doc: Dict[str, Any]) -> Optional[Dict[s
     try:
         candidates = await cursor.to_list(length=200)
     except Exception:
+        # fallback to manual gather
         candidates = []
         async for d in videos.find({}):
             candidates.append(d)
+
     for d in candidates:
         fid = d.get("file_id")
         if fid and fid not in sent:
@@ -37,22 +38,31 @@ async def get_unseen_video_for_user(user_doc: Dict[str, Any]) -> Optional[Dict[s
 async def record_sent(user_id: int, file_id: str):
     await users.update_one({"user_id": user_id}, {"$addToSet": {"sent_file_ids": file_id}})
 
-async def send_one_video(chat_id: int, user_doc: Dict[str, Any], ad_token: Optional[str]=None, ad_url: Optional[str]=None) -> bool:
+async def send_one_video(application, chat_id: int, user_doc: Dict[str, Any], ad_token: Optional[str]=None, ad_url: Optional[str]=None) -> bool:
+    """
+    application: telegram.ext.Application (used to run send coroutine)
+    Sends one unseen video for user to chat_id. Returns True if sent.
+    """
     vid = await get_unseen_video_for_user(user_doc)
     if not vid:
-        await bot.send_message(chat_id, "No unseen videos available right now. Check later.")
+        await application.bot.send_message(chat_id=chat_id, text="No unseen videos available right now. Check later.")
         return False
-    file_id = vid["file_id"]
+
+    file_id = vid.get("file_id")
     caption = vid.get("caption", "")
     kb = video_control_buttons(token_for_ad=ad_token, ad_short_url=ad_url)
     try:
-        await bot.send_video(chat_id=chat_id, video=file_id, caption=caption, reply_markup=kb)
+        # try to send as file_id (file already on Telegram) else as url
+        if file_id.startswith("http"):
+            await application.bot.send_video(chat_id=chat_id, video=file_id, caption=caption, reply_markup=kb)
+        else:
+            await application.bot.send_video(chat_id=chat_id, video=file_id, caption=caption, reply_markup=kb)
         await record_sent(user_doc["user_id"], file_id)
         return True
     except TelegramError as e:
         log.exception("send_one_video error: %s", e)
         try:
-            await bot.send_message(chat_id, "Failed to deliver video. Try later.")
+            await application.bot.send_message(chat_id, "Failed to deliver video. Try later.")
         except Exception:
             pass
         return False
