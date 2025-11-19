@@ -1,83 +1,55 @@
-# main.py — Full working Telegram bot with ShortXLinks integration
-# Author: ChatGPT (Replace-ready)
-# Works on Render/Heroku/PythonAnywhere/Local
+# app/telegram/bot.py
+# Async Telegram bot using python-telegram-bot v20+
+# Replace-ready file — start point for the whole Telegram subsystem.
 
 import os
-import requests
-import telebot
-from urllib.parse import quote_plus
+import logging
 from dotenv import load_dotenv
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder,
+    ContextTypes,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    filters,
+)
 
-# Load .env values
+# load env
 load_dotenv()
-
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-SHORTX_API_KEY = os.getenv("SHORTX_API_KEY")
+SHORTLINK_API_KEY = os.getenv("SHORTLINK_API_KEY")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
 if not BOT_TOKEN:
-    raise Exception("ERROR: BOT_TOKEN missing in environment variables (.env)")
+    raise RuntimeError("BOT_TOKEN required in env")
 
-if not SHORTX_API_KEY:
-    raise Exception("ERROR: SHORTX_API_KEY missing in environment variables (.env)")
+logging.basicConfig(level=getattr(logging, LOG_LEVEL.upper(), logging.INFO))
+logger = logging.getLogger(__name__)
 
-bot = telebot.TeleBot(BOT_TOKEN)
+# Import handlers after setting logging/env so they can import config safely
+from app.telegram import handlers  # noqa: E402 (handlers will register with the app)
 
-# ------------------------------------------------------------------------------
+def build_app():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-def create_short_link(long_url: str) -> str | None:
-    """Shorten URL using ShortXLinks (format=text). Returns short URL or None."""
+    # Register handlers defined in app.telegram.handlers (module)
+    handlers.register_handlers(app)
+
+    return app
+
+async def run():
+    app = build_app()
+    logger.info("Starting bot (async)…")
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+    # keep running until cancelled
+    await app.updater.idle()
+
+if __name__ == "__main__":
+    import asyncio
     try:
-        encoded_url = quote_plus(long_url, safe=':/?&=#')
-
-        api_url = (
-            f"https://shortxlinks.com/api?"
-            f"api={SHORTX_API_KEY}&url={encoded_url}&format=text"
-        )
-
-        resp = requests.get(api_url, timeout=10)
-        short = resp.text.strip()
-
-        # API returns "" when failed → treat as failure
-        if short == "":
-            return None
-
-        return short
-
-    except Exception as e:
-        print("ERROR calling ShortXLinks:", e)
-        return None
-
-# ------------------------------------------------------------------------------
-
-@bot.message_handler(commands=["start", "help"])
-def start(message):
-    bot.reply_to(
-        message,
-        "Send me any full URL (starting with http/https) — I will return a short link."
-    )
-
-# ------------------------------------------------------------------------------
-
-@bot.message_handler(func=lambda m: True, content_types=['text'])
-def handle(message):
-    text = message.text.strip()
-
-    # Basic URL check
-    if not (text.startswith("http://") or text.startswith("https://")):
-        bot.reply_to(message, "Send a proper full link like:\nhttps://example.com/page")
-        return
-
-    bot.send_chat_action(message.chat.id, "typing")
-
-    short = create_short_link(text)
-
-    if not short:
-        bot.reply_to(message, "Shortlink generate కాలేదు. నీ URL లేదా API key చెక్ చేసుకో.")
-        return
-
-    bot.reply_to(message, f"Short Link:\n{short}")
-
-# ------------------------------------------------------------------------------
-
-print("Bot running…")
-bot.infinity_polling(timeout=20, long_polling_timeout=5)
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
