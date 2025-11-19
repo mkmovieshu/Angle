@@ -1,44 +1,55 @@
 # app/telegram/handlers_ad.py
 import os
 import logging
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+import asyncio
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
-
-from app.ads import service as ads_service
-from app.database import users  # motor async collection
-from app.telegram.video_service import send_one_video
-
-FREE_LIMIT = int(os.getenv("FREE_LIMIT") or 5)
-ADMIN_CONTACT = os.getenv("ADMIN_CONTACT")  # "https://t.me/YourAdmin"
+import httpx
 
 log = logging.getLogger(__name__)
 
-def make_watch_keyboard(token: str, short_url: str = None, admin_contact: str = None) -> InlineKeyboardMarkup:
-    buttons = []
-    if short_url:
-        buttons.append([InlineKeyboardButton("Watch Ad (open)", url=short_url)])
-    buttons.append([InlineKeyboardButton("I Watched ✅", callback_data=f"ad_check:{token}")])
-    if admin_contact:
-        buttons.append([InlineKeyboardButton("Buy Premium", url=admin_contact)])
-    return InlineKeyboardMarkup(buttons)
+BACKEND_BASE = os.getenv("DOMAIN") or os.getenv("BACKEND_URL") or ""  # DOMAIN expected (e.g., https://angle-jldx.onrender.com)
+if BACKEND_BASE and not BACKEND_BASE.startswith("http"):
+    BACKEND_BASE = "https://" + BACKEND_BASE
+
+CREATE_ENDPOINT = f"{BACKEND_BASE.rstrip('/')}/ad/create-session"
+GET_SESSION = f"{BACKEND_BASE.rstrip('/')}/ad/session"
 
 async def start_ad_flow_for_user(application, chat_id: int, user_id: int, dest_url: str = None):
     """
-    Create ad session and send user the Watch Ad keyboard.
-    application: telegram.ext.Application
+    Call backend to create ad session, then send the shortlink + I Watched button
     """
-    res = ads_service.create_ad_session(user_id=user_id, dest_url=dest_url)
-    token = res["token"]
-    short_url = res.get("short_url")
-    admin_link = ADMIN_CONTACT
-    text = "To continue watching more videos you must watch an ad. Open the ad link and after watching press I Watched."
-    kb = make_watch_keyboard(token, short_url, admin_link)
-    await application.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
+    payload = {"user_id": user_id}
+    if dest_url:
+        payload["dest_url"] = dest_url
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            r = await client.post(CREATE_ENDPOINT, json=payload)
+            if r.status_code != 200:
+                await application.bot.send_message(chat_id=chat_id, text="Failed to create ad session. Try again later.")
+                return
+            j = r.json()
+        except Exception as e:
+            log.exception("create session failed: %s", e)
+            await application.bot.send_message(chat_id=chat_id, text="Failed to contact ad server.")
+            return
+
+    short_url = j.get("short_url") or j.get("callback_url")
+    token = j.get("token")
+    if not token or not short_url:
+        await application.bot.send_message(chat_id=chat_id, text="Ad session could not be created.")
+        return
+
+    kb = [
+        [InlineKeyboardButton("▶ Open Ad", url=short_url)],
+        [InlineKeyboardButton("I Watched ✅", callback_data=f"ad_check:{token}")]
+    ]
+    kb_markup = InlineKeyboardMarkup(kb)
+    text = "Open the ad link and after watching press *I Watched*."
+    await application.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb_markup)
 
 async def handle_ad_check_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Called when user clicks "I Watched" button (callback_data ad_check:{token})
-    """
     query = update.callback_query
     if not query or not query.data:
         return
@@ -46,25 +57,42 @@ async def handle_ad_check_callback(update: Update, context: ContextTypes.DEFAULT
     if not data.startswith("ad_check:"):
         await query.answer("Invalid callback", show_alert=True)
         return
-
     token = data.split(":", 1)[1]
-    session = ads_service.get_session(token)
-    if not session:
-        await query.answer("Session not found or expired.", show_alert=True)
+
+    # call backend to validate session
+    check_url = f"{GET_SESSION}/{token}"
+    async with httpx.AsyncClient(timeout=8.0) as client:
+        try:
+            r = await client.get(check_url)
+            if r.status_code == 200:
+                j = r.json()
+            else:
+                j = None
+        except Exception as e:
+            log.exception("session check failed: %s", e)
+            j = None
+
+    if not j:
+        await query.answer("Could not verify. Try again in a few seconds.", show_alert=True)
         return
 
-    if not session.get("completed"):
-        short_url = session.get("short_url")
-        msg = "We couldn't verify your ad view yet. Open the ad link and finish the ad, then press I Watched again."
-        if short_url:
-            msg += f"\n\nAd link: {short_url}"
-        await query.answer(text="Ad not verified", show_alert=True)
-        await query.message.reply_text(msg)
+    if j.get("completed"):
+        await query.answer("Ad already verified — unlocked!", show_alert=True)
+        # perform unlock logic: e.g., reset free counter, send next video (ensure your video_service uses motor)
+        uid = j.get("user_id")
+        # example: calling video_service directly might be better than delegating via bot
+        try:
+            from app.telegram.video_service import send_one_video, ensure_user_doc
+            user_doc = await ensure_user_doc(uid)
+            await send_one_video(context.application, chat_id=query.message.chat.id, user_doc=user_doc)
+        except Exception:
+            # fallback message
+            await query.message.reply_text("Ad verified — enjoy the next videos!")
         return
-
-    # completed -> unlock logic: reset free counter
-    await users.update_one({"user_id": session["user_id"]}, {"$set": {"free_used": 0}})
-    await query.answer(text="Ad verified — unlocked!", show_alert=True)
-
-    # send next video
-    await send_one_video(context.application, chat_id=query.message.chat.id, user_doc={"user_id": session["user_id"], "sent_file_ids": []})
+    else:
+        # Not yet completed. Tell user to finish ad (the shortlink must ensure final redirect to callback)
+        await query.answer("Ad not verified yet. Make sure you finished the ad and the page redirected back.", show_alert=True)
+        # show the short url again
+        short = j.get("short_url")
+        if short:
+            await query.message.reply_text(f"Open again: {short}")
