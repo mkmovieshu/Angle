@@ -1,12 +1,10 @@
+# telegram/bot.py
 import asyncio
 import os
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    CallbackQueryHandler
-)
-from app.telegram.handlers import start_handler, next_handler
-from app.telegram.handlers_ad import handle_ad_check
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler
+
+from telegram.handlers import start_handler, next_handler
+from telegram.handlers_ad import handle_ad_check
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
@@ -23,4 +21,7 @@ async def run():
     await app.updater.idle()
 
 if __name__ == "__main__":
-    asyncio.run(run())
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        pass
