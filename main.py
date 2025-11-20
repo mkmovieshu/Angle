@@ -1,5 +1,6 @@
+# main.py
 from fastapi import FastAPI
-from app.web.ad_routes import router as ad_router
+from web.ad_routes import router as ad_router
 
 app = FastAPI()
 
