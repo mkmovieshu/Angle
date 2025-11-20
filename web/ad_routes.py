@@ -1,6 +1,7 @@
+# web/ad_routes.py
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import HTMLResponse
-from app.ads import service
+from ads import service as ads_service
 
 router = APIRouter()
 
@@ -9,22 +10,21 @@ async def create(payload: dict):
     user_id = payload.get("user_id")
     if not user_id:
         raise HTTPException(status_code=400, detail="user_id missing")
-
-    session = await service.create_ad_session(user_id)
+    session = await ads_service.create_ad_session(int(user_id))
     return {
         "token": session["token"],
-        "short_url": session["short_url"] or session["callback_url"],
+        "short_url": session.get("short_url") or session["callback_url"],
         "callback_url": session["callback_url"]
     }
 
 @router.get("/ad/callback/{token}", response_class=HTMLResponse)
 async def cb(token: str):
-    await service.mark_completed(token)
+    await ads_service.mark_completed(token)
     return "<h2>Ad verified — you can return to the bot.</h2>"
 
 @router.get("/ad/session/{token}")
 async def session_info(token: str):
-    s = await service.get_session(token)
+    s = await ads_service.get_session(token)
     if not s:
         raise HTTPException(status_code=404)
-    return {"completed": s["completed"], "user_id": s["user_id"], "short_url": s["short_url"]}
+    return {"completed": s.get("completed", False), "user_id": s["user_id"], "short_url": s.get("short_url")}
