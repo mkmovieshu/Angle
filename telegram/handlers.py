@@ -1,6 +1,7 @@
+# telegram/handlers.py
 from telegram import Update
 from telegram.ext import ContextTypes
-from app.telegram.video_service import ensure_user, send_video
+from telegram.video_service import ensure_user, send_video
 
 async def start_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = await ensure_user(update.effective_user.id)
